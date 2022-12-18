@@ -2,8 +2,8 @@ use clap::Parser;
 use std::{
     error::Error,
     fs::File,
-    io::{prelude, Read},
-    slice,
+    io::Read,
+    collections::HashMap,
 };
 
 #[derive(Parser, Debug)]
@@ -20,7 +20,7 @@ struct BufReader {
     file: File,
     buffer: [u8; BUF_READER_CHUNK_SIZE],
     readlen: usize,
-    cursor: i32,
+    cursor: usize,
     is_complete: bool,
 }
 
@@ -41,6 +41,21 @@ impl BufReader {
     ) -> Result<String, Box<dyn Error>> {
         self.read_until(pred)
             .and_then(|s| self.read_n(1).map(|_| s))
+    }
+
+    fn peek(&mut self) -> Result<u8, Box<dyn Error>> {
+        loop {
+            if self.is_complete {
+                return Err("End of stream".into());
+            }
+
+            if self.is_end_of_stream() {
+                self.fill_buffer()?;
+                continue;
+            }
+
+            return Ok(self.buffer[self.cursor]);
+        }
     }
 
     fn read_until(&mut self, pred: fn(u8) -> bool) -> Result<String, Box<dyn Error>> {
@@ -68,7 +83,7 @@ impl BufReader {
     }
 
     fn is_end_of_stream(&self) -> bool {
-        self.cursor >= self.readlen as i32
+        self.cursor >= self.readlen
     }
 
     fn read_n(&mut self, n: usize) -> Result<String, Box<dyn Error>> {
@@ -76,7 +91,7 @@ impl BufReader {
         let mut out = String::new();
 
         while n > 0 || self.is_complete {
-            let slice_len = i32::min(n as i32, (self.readlen as i32) - self.cursor);
+            let slice_len = i32::min(n as i32, (self.readlen - self.cursor) as i32);
 
             if slice_len == 0 {
                 self.fill_buffer()?;
@@ -85,11 +100,39 @@ impl BufReader {
 
             out.push_str(
                 String::from_utf8(
-                    self.buffer[self.cursor as usize..(self.cursor + slice_len) as usize].into(),
+                    self.buffer[self.cursor as usize..self.cursor + slice_len as usize].into(),
                 )?
                 .as_str(),
             );
-            self.cursor += slice_len;
+            self.cursor += slice_len as usize;
+
+            n -= slice_len;
+        }
+
+        if n > 0 {
+            return Err("not enough bytes".into());
+        }
+
+        Ok(out)
+    }
+    
+
+    fn read_bytes_n(&mut self, n: usize) -> Result<Vec<u8>, Box<dyn Error>> {
+        let mut n = n as i32;
+        let mut out = vec![];
+
+        while n > 0 || self.is_complete {
+            let slice_len = i32::min(n as i32, (self.readlen - self.cursor) as i32);
+
+            if slice_len == 0 {
+                self.fill_buffer()?;
+                continue;
+            }
+
+            out.append(
+                &mut self.buffer[self.cursor as usize..self.cursor + slice_len as usize].to_vec()
+            );
+            self.cursor += slice_len as usize;
 
             n -= slice_len;
         }
@@ -106,15 +149,13 @@ impl BufReader {
             return Err("reader is already complete".into());
         }
 
-        if self.cursor < self.readlen as i32 {
+        if self.cursor < self.readlen {
             return Err("buffer is not yet consumed".into());
         }
 
         self.file
             .read(&mut self.buffer)
             .and_then(|size| {
-                dbg!(size);
-
                 self.readlen = size;
                 self.cursor = 0;
 
@@ -126,15 +167,102 @@ impl BufReader {
     }
 }
 
+#[derive(Debug)]
+enum BenType {
+    Str(String),
+    Int(i32),
+    List(Vec<BenType>),
+    Dict(HashMap<String, BenType>),
+    Pieces(Vec<Vec<u8>>),
+}
+
+impl BenType {
+    fn read_into(reader: &mut BufReader) -> Result<Self, Box<dyn Error>> {
+        match reader.peek()? {
+            b'd' => Ok(BenType::Dict(BenType::read_dictionary(reader)?)),
+            b'i' => Ok(BenType::Int(BenType::read_int(reader)?)),
+            b'l' => Ok(BenType::List(BenType::read_list(reader)?)),
+            _ => Ok(BenType::Str(BenType::read_string(reader)?)),
+        }
+    }
+
+    fn read_dictionary(reader: &mut BufReader) -> Result<HashMap<String, BenType>, Box<dyn Error>> {
+        assert_eq!("d".to_owned(), reader.read_n(1)?);
+
+        let mut out = HashMap::new();
+
+        loop {
+            if reader.peek()? == b'e' {
+                assert_eq!("e".to_owned(), reader.read_n(1)?);
+                break;
+            }
+
+            let key = BenType::read_string(reader)?;
+            let value = match key.as_str() {
+                "pieces" => BenType::read_pieces(reader)?,
+                _ => BenType::read_into(reader)?,
+            };
+
+            out.insert(key, value);
+        }
+
+        Ok(out)
+    }
+
+    fn read_list(reader: &mut BufReader) -> Result<Vec<BenType>, Box<dyn Error>> {
+        assert_eq!("l".to_owned(), reader.read_n(1)?);
+
+        let mut list = vec![];
+
+        loop {
+            if reader.peek()? == b'e' {
+                assert_eq!("e".to_owned(), reader.read_n(1)?);
+                break;
+            }
+
+            let val = BenType::read_into(reader)?;
+
+            list.push(val);
+        }
+
+        Ok(list)
+    }
+
+    fn read_string(reader: &mut BufReader) -> Result<String, Box<dyn Error>> {
+        let len_raw = reader.read_until_and_swallow_last(|b| {
+            b != ':' as u8
+        })?;
+        
+        let len = usize::from_str_radix(&len_raw, 10)?;
+        let bytes = reader.read_bytes_n(len)?;
+        Ok(String::from_utf8(bytes).unwrap_or("error".to_owned()))
+    }
+
+    fn read_pieces(reader: &mut BufReader) -> Result<BenType, Box<dyn Error>> {
+        let len_raw = reader.read_until_and_swallow_last(|b| {
+            b != ':' as u8
+        })?;
+        let len = usize::from_str_radix(&len_raw, 10)?;
+
+        Ok(BenType::Pieces(reader.read_bytes_n(len)?.chunks(20).map(|chunk| chunk.to_vec()).collect()))
+    }
+
+    fn read_int(reader: &mut BufReader) -> Result<i32, Box<dyn Error>> {
+        assert_eq!("i".to_owned(), reader.read_n(1)?);
+
+        let int_raw = reader.read_until_and_swallow_last(|b| b != b'e')?;
+
+        Ok(i32::from_str_radix(int_raw.as_str(), 10)?)
+    }
+}
+
+#[derive(Debug)]
 struct Torrent {}
 
 impl Torrent {
     fn new(filename: String) -> Result<Torrent, Box<dyn Error>> {
         let mut buf_reader = BufReader::new(filename)?;
-
-        dbg!(buf_reader.read_until_and_swallow_last(|byte| byte != ':' as u8));
-
-        dbg!(buf_reader.read_n(16));
+        let ben = BenType::read_into(&mut buf_reader)?;
 
         Ok(Torrent {})
     }
@@ -143,4 +271,6 @@ impl Torrent {
 fn main() {
     let args = Args::parse();
     let torrent = Torrent::new(args.filename);
+
+    dbg!(torrent);
 }
