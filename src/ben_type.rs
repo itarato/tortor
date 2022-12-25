@@ -1,15 +1,25 @@
 use std::error::Error;
 
+use sha1::digest::generic_array::functional::FunctionalSequence;
+use sha1::{Digest, Sha1};
+
 use crate::byte_reader::*;
 use crate::stable_hash_map::*;
 
 #[derive(Debug)]
+pub struct IP {
+    pub address: [u8; 4],
+    pub port: u16,
+}
+
+#[derive(Debug)]
 pub enum BenType {
     Str(String),
-    Int(i32),
+    Int(i64),
     List(Vec<BenType>),
     Dict(StableHashMap<String, BenType>),
     Pieces(Vec<Vec<u8>>),
+    Peers(Vec<IP>),
 }
 
 impl BenType {
@@ -36,10 +46,29 @@ impl BenType {
             }
 
             let key = BenType::read_string(reader)?;
+
+            let mut info_start = 0usize;
+            if key == "info".to_owned() {
+                dbg!(reader.pos);
+                info_start = reader.pos;
+            }
+
             let value = match key.as_str() {
                 "pieces" => BenType::read_pieces(reader)?,
+                "peers" => BenType::read_peers(reader)?,
                 _ => BenType::read_into(reader)?,
             };
+
+            if key == "info".to_owned() {
+                dbg!(reader.pos);
+
+                let mut hasher = Sha1::new();
+                hasher.update(reader.bytes[info_start..reader.pos].to_vec());
+
+                dbg!(hasher.finalize().map(|b| format!("%{:02x}", b)).join(""));
+                // %3b%24%55%04%cf%5f%11%bb%db%e1%20%1c%ea%6a%6b%f4%5a%ee%1b%c0
+                // %3b%24%55%04%cf%5f%11%bb%db%e1%20%1c%ea%6a%6b%f4%5a%ee%1b%c0
+            }
 
             out.insert(key, value);
         }
@@ -91,11 +120,29 @@ impl BenType {
         ))
     }
 
-    fn read_int(reader: &mut ByteReader) -> Result<i32, Box<dyn Error>> {
+    fn read_peers(reader: &mut ByteReader) -> Result<BenType, Box<dyn Error>> {
+        let len_raw = reader.take_while(|b| b != b':');
+        let len = usize::from_str_radix(std::str::from_utf8(len_raw)?, 10)?;
+
+        assert_eq!(Some(b':'), reader.next());
+
+        Ok(BenType::Peers(
+            reader
+                .take_n(len)
+                .chunks(6)
+                .map(|chunk| IP {
+                    address: chunk[0..4].try_into().unwrap(),
+                    port: ((chunk[4] as u16) << 8) | chunk[5] as u16,
+                })
+                .collect(),
+        ))
+    }
+
+    fn read_int(reader: &mut ByteReader) -> Result<i64, Box<dyn Error>> {
         assert_eq!(Some(b'i'), reader.next());
 
         let int_raw = reader.take_while(|b| b != b'e');
-        let int = i32::from_str_radix(std::str::from_utf8(int_raw)?, 10)?;
+        let int = i64::from_str_radix(std::str::from_utf8(int_raw)?, 10)?;
 
         assert_eq!(Some(b'e'), reader.next());
 
@@ -114,9 +161,6 @@ impl BenType {
                     out.append(&mut len_bytes);
                     out.push(b':');
                     out.append(&mut k.bytes().collect());
-
-                    dbg!(k);
-
                     out.append(&mut v.serialize());
                 }
 
@@ -147,35 +191,59 @@ impl BenType {
                 out.push(b':');
                 out.append(&mut str.bytes().collect());
             }
+            BenType::Peers(peers) => {
+                let len = peers.len() * 6;
+                out.append(&mut len.to_string().bytes().collect());
+                out.push(b':');
+                for peer in peers {
+                    out.append(&mut peer.address.to_vec());
+                    out.push((peer.port >> 8) as u8);
+                    out.push((peer.port & 0xFF) as u8);
+                }
+            }
         }
 
         out
     }
 
-    pub fn try_into_dict(&self) -> Option<&StableHashMap<String, BenType>> {
+    pub fn try_into_dict(self) -> Option<StableHashMap<String, BenType>> {
         match self {
             BenType::Dict(dict) => Some(dict),
             _ => None,
         }
     }
 
-    pub fn try_into_pieces(&self) -> Option<&Vec<Vec<u8>>> {
+    pub fn try_into_pieces(self) -> Option<Vec<Vec<u8>>> {
         match self {
             BenType::Pieces(pieces) => Some(pieces),
             _ => None,
         }
     }
 
-    pub fn try_into_str(&self) -> Option<&String> {
+    pub fn try_into_str(self) -> Option<String> {
         match self {
             BenType::Str(s) => Some(s),
             _ => None,
         }
     }
 
-    pub fn try_into_int(&self) -> Option<i32> {
+    pub fn try_into_int(self) -> Option<i64> {
         match self {
-            BenType::Int(i) => Some(*i),
+            BenType::Int(i) => Some(i),
+            _ => None,
+        }
+    }
+
+    pub fn try_into_peers(self) -> Option<Vec<IP>> {
+        match self {
+            BenType::Peers(peers) => Some(peers),
+            _ => None,
+        }
+    }
+
+    pub fn try_into_list(self) -> Option<Vec<BenType>> {
+        match self {
+            BenType::List(list) => Some(list),
             _ => None,
         }
     }

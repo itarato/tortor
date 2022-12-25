@@ -1,4 +1,4 @@
-use std::{borrow::Borrow, collections::HashMap, hash::Hash, ops::Index};
+use std::{borrow::Borrow, collections::HashMap, fmt::Display, hash::Hash, ops::Index};
 
 #[derive(Debug)]
 pub struct StableHashMap<K, V> {
@@ -27,6 +27,20 @@ impl<K: Eq + Hash, V> StableHashMap<K, V> {
     {
         self.map.insert(key.clone(), value);
         self.keys.push(key);
+    }
+
+    pub fn remove(&mut self, key: &K) -> Option<V>
+    where
+        K: Display,
+    {
+        let v = self.map.remove(key);
+        let key_position = self
+            .keys
+            .iter()
+            .position(|e| e == key)
+            .expect(format!("Has key: {}", key).as_str());
+        self.keys.remove(key_position);
+        v
     }
 }
 

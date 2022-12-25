@@ -1,6 +1,6 @@
 pub struct ByteReader {
-    bytes: Vec<u8>,
-    pos: usize,
+    pub bytes: Vec<u8>,
+    pub pos: usize,
 }
 
 impl ByteReader {
