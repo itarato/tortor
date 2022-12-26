@@ -4,28 +4,52 @@ mod stable_hash_map;
 
 use byte_reader::ByteReader;
 use clap::Parser;
+use rand::Rng;
 use sha1::{Digest, Sha1};
-use std::{
-    collections::VecDeque,
-    error::Error,
-    fs::File,
-    io::{Read, Write},
-    net::SocketAddr,
-};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpStream, UdpSocket},
-};
+use simple_logger::SimpleLogger;
+use std::{error::Error, fs::File, io::Read, net::SocketAddr};
+use tokio::net::UdpSocket;
 
 use crate::ben_type::*;
 
-static PEER_ID: &'static str = "M0-0-0--IT2022------";
+macro_rules! to_buf {
+    ($e: expr, $i: ident) => {
+        for b in $e.to_be_bytes() {
+            $i.push(b);
+        }
+    };
+}
+
+macro_rules! vec_to_buf {
+    ($e: expr, $i: ident) => {
+        for b in $e {
+            $i.push(*b);
+        }
+    };
+}
+
+static LOCAL_SOCKET_ADDR: &'static str = "0.0.0.0:6881";
+static LOCAL_PORT: u16 = 6881;
+static PEER_ID: &'static str = "M0-0-1--IT2022------";
+static CONNECT_MAGIC_NUMBER: u64 = 0x41727101980;
+static ACTION_CONNECT: u32 = 0;
+static ACTION_ANNOUNCE: u32 = 1;
+static ACTION_SCRAPE: u32 = 2;
+static ACTION_ERROR: u32 = 3;
+static ANNOUNCE_EVENT_NONE: u32 = 0;
+static ANNOUNCE_EVENT_COMPLETED: u32 = 1;
+static ANNOUNCE_EVENT_STARTED: u32 = 2;
+static ANNOUNCE_EVENT_STOPPED: u32 = 3;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
     #[arg(short = 'f')]
     filename: String,
+}
+
+fn action_code(buf: &[u8]) -> u32 {
+    u32::from_be_bytes(buf[0..4].try_into().expect("Has 4 bytes"))
 }
 
 #[derive(Debug)]
@@ -37,15 +61,69 @@ struct AnnounceInfo {
 }
 
 #[derive(Debug)]
-struct Announce {
+struct ConnectResponse {
+    transaction_id: u32,
+    connection_id: u64,
+}
+
+impl From<&[u8]> for ConnectResponse {
+    fn from(value: &[u8]) -> Self {
+        Self {
+            transaction_id: u32::from_be_bytes(value[4..8].try_into().expect("Can obtain: 4..8")),
+            connection_id: u64::from_be_bytes(value[8..16].try_into().expect("Can obtain: 8..16")),
+        }
+    }
+}
+
+impl ConnectResponse {
+    fn is_valid(&self, expected_transaction_id: u32) -> bool {
+        self.transaction_id == expected_transaction_id
+    }
+}
+
+#[derive(Debug)]
+struct AnnounceResponse {
+    transaction_id: u32,
+    interval: u32,
+    leechers: u32,
+    seeders: u32,
+}
+
+impl From<&[u8]> for AnnounceResponse {
+    fn from(value: &[u8]) -> Self {
+        Self {
+            transaction_id: u32::from_be_bytes(value[4..8].try_into().expect("Failed bytes: 4..8")),
+            interval: u32::from_be_bytes(value[8..12].try_into().expect("Failed bytes: 8..12")),
+            leechers: u32::from_be_bytes(value[12..16].try_into().expect("Failed bytes: 12..16")),
+            seeders: u32::from_be_bytes(value[16..20].try_into().expect("Failed bytes: 16..20")),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ErrorResponse {
+    transaction_id: u32,
+    msg: String,
+}
+
+impl From<&[u8]> for ErrorResponse {
+    fn from(value: &[u8]) -> Self {
+        Self {
+            transaction_id: u32::from_be_bytes(value[4..8].try_into().expect("No 4..8 bytes")),
+            msg: String::from_utf8(value[8..].to_vec()).expect("Failed decoding error message"),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Tracker {
     announce: String,
-    // announce_list: Vec<String>,
     info: AnnounceInfo,
     info_hash: Vec<u8>,
 }
 
-impl Announce {
-    fn new(filename: String) -> Result<Announce, Box<dyn Error>> {
+impl Tracker {
+    fn new(filename: String) -> Result<Tracker, Box<dyn Error>> {
         let mut bytes: Vec<u8> = vec![];
         let mut file = File::open(filename)?;
         file.read_to_end(&mut bytes)?;
@@ -53,12 +131,6 @@ impl Announce {
         let mut byte_reader = ByteReader::new(bytes);
 
         let ben = BenType::read_into(&mut byte_reader)?;
-
-        let mut out_file = File::create("./sample.torrent").expect("Can create test out file");
-        out_file
-            .write_all(ben.serialize().as_slice())
-            .expect("Can write test output");
-
         let mut ben_map = ben.try_into_dict().unwrap();
 
         let mut hasher = Sha1::new();
@@ -72,25 +144,12 @@ impl Announce {
             .try_into_dict()
             .unwrap();
 
-        return Ok(Announce {
+        return Ok(Tracker {
             announce: ben_map
                 .remove(&"announce".to_owned())
                 .unwrap()
                 .try_into_str()
                 .unwrap(),
-            // announce_list: ben_map
-            //     .remove(&"announce-list".to_owned())
-            //     .unwrap()
-            //     .try_into_list()
-            //     .unwrap()
-            //     .into_iter()
-            //     .flat_map(|list| {
-            //         list.try_into_list()
-            //             .unwrap()
-            //             .into_iter()
-            //             .map(|e| e.try_into_str().unwrap())
-            //     })
-            //     .collect(),
             info: AnnounceInfo {
                 pieces: info
                     .remove(&"pieces".to_owned())
@@ -117,173 +176,136 @@ impl Announce {
         });
     }
 
-    fn announce_url(&self) -> String {
-        format!(
-            "{}?info_hash={}&left={}&peer_id={}&port=6881&uploaded=0&downloaded=0&compact=1&numwant=10",
-            self.announce,
-            self.info_hash
-                .iter()
-                .map(|b| format!("%{:02x}", b))
-                .collect::<String>(),
-            self.info.len,
-            PEER_ID,
-        )
+    fn announce_addr(&self) -> SocketAddr {
+        url::Url::parse(self.announce.as_str())
+            .expect("URL is not parsable")
+            .socket_addrs(|| Some(6881))
+            .expect("Cannot extract socket addr")
+            .into_iter()
+            .next()
+            .expect("No socket addr")
     }
 
-    fn handshake_body(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.push(0x13);
+    async fn connect(&self) -> ConnectResponse {
+        let stream = UdpSocket::bind(LOCAL_SOCKET_ADDR)
+            .await
+            .expect("Handshake connection established");
 
-        for b in b"BitTorrent protocol" {
-            out.push(*b);
-        }
+        stream
+            .connect(self.announce_addr())
+            .await
+            .expect("Can connect to peer");
 
-        for _ in 0..8 {
-            out.push(0);
-        }
+        let mut buf: Vec<u8> = vec![];
 
-        self.info_hash.iter().for_each(|b| out.push(*b));
+        let mut rng = rand::thread_rng();
+        let transaction_id = rng.gen::<u32>();
 
-        PEER_ID.bytes().for_each(|b| out.push(b));
+        to_buf!(CONNECT_MAGIC_NUMBER, buf);
+        to_buf!(ACTION_CONNECT, buf);
+        to_buf!(transaction_id, buf);
 
-        out
+        log::info!("Connection request start");
+        stream
+            .send_to(&buf, self.announce_addr())
+            .await
+            .expect("Can send connect payload");
+        log::info!("Connection request end");
+
+        let mut response_buf: [u8; 64] = [0; 64];
+        log::info!("Connection response listen");
+        stream
+            .recv(&mut response_buf)
+            .await
+            .expect("Can receive connection response");
+        log::info!("Connection response received");
+
+        let action_code = action_code(&response_buf[..]);
+        assert_eq!(ACTION_CONNECT, action_code);
+
+        let resp: ConnectResponse = response_buf[..].into();
+
+        assert!(resp.is_valid(transaction_id));
+
+        resp
     }
-}
 
-#[derive(Debug)]
-struct AnnounceResponse {
-    // interval: i64,
-    // complete: i64,
-    // incomplete: i64,
-    peers: Vec<IP>,
-}
+    async fn announce(&self, connection_id: u64) -> AnnounceResponse {
+        let stream = UdpSocket::bind(LOCAL_SOCKET_ADDR)
+            .await
+            .expect("Handshake connection established");
 
-impl AnnounceResponse {
-    fn ip_string(&self, n: usize) -> Option<String> {
-        if n >= self.peers.len() {
-            None
+        stream
+            .connect(self.announce_addr())
+            .await
+            .expect("Can connect to peer");
+
+        let mut buf: Vec<u8> = vec![];
+
+        let mut rng = rand::thread_rng();
+        let transaction_id = rng.gen::<u32>();
+        let key = rng.gen::<u32>();
+
+        to_buf!(connection_id, buf);
+        to_buf!(ACTION_ANNOUNCE, buf);
+        to_buf!(transaction_id, buf);
+        vec_to_buf!(&self.info_hash, buf);
+        vec_to_buf!(&PEER_ID.bytes().collect::<Vec<u8>>(), buf);
+        to_buf!(0u64, buf); // FIXME: Set downloaded to a real value.
+        to_buf!(self.info.len as u64, buf);
+        to_buf!(0u64, buf); // FIXME: Set uploaded to a real value.
+        to_buf!(ANNOUNCE_EVENT_NONE, buf);
+        to_buf!(0u32, buf); // IP address.
+        to_buf!(key, buf); // FIXME: What is a key?
+        to_buf!(10u32, buf); // Numwant.
+        to_buf!(LOCAL_PORT, buf);
+
+        assert_eq!(98, buf.len());
+
+        log::info!("Announce request start");
+        stream
+            .send_to(&buf, self.announce_addr())
+            .await
+            .expect("Failed announcing");
+        log::info!("Announce request end");
+
+        let mut response_buf: [u8; 256] = [0; 256];
+
+        log::info!("Announce response listen");
+        stream
+            .recv(&mut response_buf)
+            .await
+            .expect("Failed getting announce response");
+        log::info!("Announce response received");
+
+        let resp_action = action_code(&response_buf[..]);
+        if resp_action == ACTION_ANNOUNCE {
+            let resp: AnnounceResponse = response_buf[..].into();
+            dbg!(&resp);
+
+            return resp;
+        } else if resp_action == ACTION_ERROR {
+            let err: ErrorResponse = response_buf[..].into();
+            assert_eq!(transaction_id, err.transaction_id);
+            dbg!(err);
         } else {
-            let ip_str = self.peers[n].address.map(|byte| byte.to_string()).join(".");
-            let port = self.peers[n].port;
-            Some(format!("{}:{}", ip_str, port))
+            log::error!("Unexpected announce response action: {}", resp_action);
+            dbg!(response_buf);
         }
+        panic!("Failed having announcement success response")
     }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    SimpleLogger::new()
+        .init()
+        .expect("Failed initializing logger");
+
     let args = Args::parse();
-    let torrent = Announce::new(args.filename).expect("Torrent can be created");
-
-    println!(
-        "Name: {}\nURL: {}",
-        torrent.info.name,
-        torrent.announce_url(),
-        // torrent.announce_list
-    );
-
-    // let resp = reqwest::get(torrent.announce_url()).await?;
-
-    // let resp_body = resp.bytes().await?.to_vec();
-    // let mut resp_ben = BenType::read_into(&mut ByteReader::new(resp_body))?
-    //     .try_into_dict()
-    //     .unwrap();
-
-    // let announce_response = AnnounceResponse {
-    //     // interval: resp_ben
-    //     //     .remove(&"interval".to_owned())
-    //     //     .unwrap()
-    //     //     .try_into_int()
-    //     //     .unwrap(),
-    //     // complete: resp_ben
-    //     //     .remove(&"complete".to_owned())
-    //     //     .unwrap()
-    //     //     .try_into_int()
-    //     //     .unwrap(),
-    //     // incomplete: resp_ben
-    //     //     .remove(&"incomplete".to_owned())
-    //     //     .unwrap()
-    //     //     .try_into_int()
-    //     //     .unwrap(),
-    //     peers: resp_ben
-    //         .remove(&"peers".to_owned())
-    //         .unwrap()
-    //         .try_into_peers()
-    //         .unwrap(),
-    // };
-
-    // if announce_response.peers.is_empty() {
-    //     println!("No peers found");
-    //     return Ok(());
-    // }
-
-    // dbg!(&announce_response);
-    // dbg!(&announce_response.ip_string(0));
-
-    let stream = UdpSocket::bind("0.0.0.0:6881")
-        .await
-        .expect("Handshake connection established");
-
-    // stream.set_ttl(3).expect("Can set TTL");
-    // let addr = torrent
-    //     .announce
-    //     .parse::<SocketAddr>()
-    //     .expect("Can make connection address");
-    stream
-        .connect("bttracker.debian.org:6969")
-        .await
-        .expect("Can connect to peer");
-
-    let mut connect_buf: Vec<u8> = vec![];
-    for b in 0x41727101980u64.to_be_bytes() {
-        connect_buf.push(b);
-    }
-    let action = 0u32;
-    for b in action.to_be_bytes() {
-        connect_buf.push(b);
-    }
-    let transaction_id = 0x12345678u32;
-    for b in transaction_id.to_be_bytes() {
-        connect_buf.push(b);
-    }
-
-    println!("Start connection payload");
-    stream
-        .send_to(&connect_buf, "bttracker.debian.org:6969")
-        .await
-        .expect("Can send connect payload");
-    println!("Sent connection payload");
-
-    let mut connect_response_buf: [u8; 16] = [0; 16];
-    println!("Start connection payload");
-    stream
-        .recv_from(&mut connect_response_buf)
-        .await
-        .expect("Can receive connection response");
-    println!("Got connection payload");
-
-    dbg!(connect_response_buf);
-
-    // // stream
-    // //     .write_all_buf(&mut torrent.handshake_body())
-    // //     .await
-    // //     .expect("Handshake payload sent");
-
-    // stream
-    //     .send(&torrent.handshake_body())
-    //     .await
-    //     .expect("Can send UDP payload.");
-
-    // let mut buf: [u8; 1] = [0; 1];
-
-    // // let handshake_resp = stream
-    // //     .read_exact(&mut buf)
-    // //     .await
-    // //     .expect("Handshare response first byte received");
-    // // dbg!(handshake_resp);
-
-    // stream.recv(&mut buf).await.expect("Got response");
-    // dbg!(buf);
+    let tracker = Tracker::new(args.filename).expect("Torrent can be created");
+    let connection_response = tracker.connect().await;
+    let announce_response = tracker.announce(connection_response.connection_id).await;
 
     Ok(())
 }
