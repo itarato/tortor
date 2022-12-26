@@ -1,8 +1,5 @@
 use std::error::Error;
 
-use sha1::digest::generic_array::functional::FunctionalSequence;
-use sha1::{Digest, Sha1};
-
 use crate::byte_reader::*;
 use crate::stable_hash_map::*;
 
@@ -47,28 +44,11 @@ impl BenType {
 
             let key = BenType::read_string(reader)?;
 
-            let mut info_start = 0usize;
-            if key == "info".to_owned() {
-                dbg!(reader.pos);
-                info_start = reader.pos;
-            }
-
             let value = match key.as_str() {
                 "pieces" => BenType::read_pieces(reader)?,
                 "peers" => BenType::read_peers(reader)?,
                 _ => BenType::read_into(reader)?,
             };
-
-            if key == "info".to_owned() {
-                dbg!(reader.pos);
-
-                let mut hasher = Sha1::new();
-                hasher.update(reader.bytes[info_start..reader.pos].to_vec());
-
-                dbg!(hasher.finalize().map(|b| format!("%{:02x}", b)).join(""));
-                // %3b%24%55%04%cf%5f%11%bb%db%e1%20%1c%ea%6a%6b%f4%5a%ee%1b%c0
-                // %3b%24%55%04%cf%5f%11%bb%db%e1%20%1c%ea%6a%6b%f4%5a%ee%1b%c0
-            }
 
             out.insert(key, value);
         }

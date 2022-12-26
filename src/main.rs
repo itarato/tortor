@@ -40,6 +40,7 @@ static ANNOUNCE_EVENT_NONE: u32 = 0;
 static ANNOUNCE_EVENT_COMPLETED: u32 = 1;
 static ANNOUNCE_EVENT_STARTED: u32 = 2;
 static ANNOUNCE_EVENT_STOPPED: u32 = 3;
+static MAX_PEERS: i32 = 8;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -186,12 +187,8 @@ impl Tracker {
             .expect("No socket addr")
     }
 
-    async fn connect(&self) -> ConnectResponse {
-        let stream = UdpSocket::bind(LOCAL_SOCKET_ADDR)
-            .await
-            .expect("Handshake connection established");
-
-        stream
+    async fn connect(&self, socket: &UdpSocket) -> ConnectResponse {
+        socket
             .connect(self.announce_addr())
             .await
             .expect("Can connect to peer");
@@ -206,7 +203,7 @@ impl Tracker {
         to_buf!(transaction_id, buf);
 
         log::info!("Connection request start");
-        stream
+        socket
             .send_to(&buf, self.announce_addr())
             .await
             .expect("Can send connect payload");
@@ -214,7 +211,7 @@ impl Tracker {
 
         let mut response_buf: [u8; 64] = [0; 64];
         log::info!("Connection response listen");
-        stream
+        socket
             .recv(&mut response_buf)
             .await
             .expect("Can receive connection response");
@@ -230,12 +227,8 @@ impl Tracker {
         resp
     }
 
-    async fn announce(&self, connection_id: u64) -> AnnounceResponse {
-        let stream = UdpSocket::bind(LOCAL_SOCKET_ADDR)
-            .await
-            .expect("Handshake connection established");
-
-        stream
+    async fn announce(&self, socket: &UdpSocket, connection_id: u64) -> AnnounceResponse {
+        socket
             .connect(self.announce_addr())
             .await
             .expect("Can connect to peer");
@@ -257,22 +250,22 @@ impl Tracker {
         to_buf!(ANNOUNCE_EVENT_NONE, buf);
         to_buf!(0u32, buf); // IP address.
         to_buf!(key, buf); // FIXME: What is a key?
-        to_buf!(10u32, buf); // Numwant.
+        to_buf!(MAX_PEERS, buf); // Numwant.
         to_buf!(LOCAL_PORT, buf);
 
         assert_eq!(98, buf.len());
 
         log::info!("Announce request start");
-        stream
+        socket
             .send_to(&buf, self.announce_addr())
             .await
             .expect("Failed announcing");
         log::info!("Announce request end");
 
-        let mut response_buf: [u8; 256] = [0; 256];
+        let mut response_buf: [u8; 2048] = [0; 2048];
 
         log::info!("Announce response listen");
-        stream
+        socket
             .recv(&mut response_buf)
             .await
             .expect("Failed getting announce response");
@@ -281,6 +274,7 @@ impl Tracker {
         let resp_action = action_code(&response_buf[..]);
         if resp_action == ACTION_ANNOUNCE {
             let resp: AnnounceResponse = response_buf[..].into();
+            assert_eq!(transaction_id, resp.transaction_id);
             dbg!(&resp);
 
             return resp;
@@ -304,8 +298,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let tracker = Tracker::new(args.filename).expect("Torrent can be created");
-    let connection_response = tracker.connect().await;
-    let announce_response = tracker.announce(connection_response.connection_id).await;
+
+    let socket = UdpSocket::bind(LOCAL_SOCKET_ADDR)
+        .await
+        .expect("Handshake connection established");
+
+    let connection_response = tracker.connect(&socket).await;
+    let announce_response = tracker
+        .announce(&socket, connection_response.connection_id)
+        .await;
 
     Ok(())
 }
