@@ -7,8 +7,13 @@ use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::Read, net::SocketAddr};
-use tokio::net::UdpSocket;
+use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc};
+use tokio::{
+    io::AsyncWriteExt,
+    net::{TcpStream, UdpSocket},
+    spawn,
+    sync::Mutex,
+};
 
 use crate::ben_type::*;
 
@@ -30,7 +35,7 @@ macro_rules! vec_to_buf {
 
 static LOCAL_SOCKET_ADDR: &'static str = "0.0.0.0:6881";
 static LOCAL_PORT: u16 = 6881;
-static PEER_ID: &'static str = "M0-0-1--IT2022------";
+static PEER_ID: &'static [u8; 20] = b"M0-0-1--IT2022------";
 static CONNECT_MAGIC_NUMBER: u64 = 0x41727101980;
 static ACTION_CONNECT: u32 = 0;
 static ACTION_ANNOUNCE: u32 = 1;
@@ -51,6 +56,22 @@ struct Args {
 
 fn action_code(buf: &[u8]) -> u32 {
     u32::from_be_bytes(buf[0..4].try_into().expect("Has 4 bytes"))
+}
+
+#[derive(Debug, Clone)]
+pub struct IP {
+    pub address: [u8; 4],
+    pub port: u16,
+}
+
+impl IP {
+    fn is_empty(&self) -> bool {
+        self.port == 0
+    }
+
+    fn socket_addr(&self) -> SocketAddr {
+        SocketAddr::new(self.address.into(), self.port)
+    }
 }
 
 #[derive(Debug)]
@@ -88,15 +109,40 @@ struct AnnounceResponse {
     interval: u32,
     leechers: u32,
     seeders: u32,
+    peer_addr_list: Vec<IP>,
 }
 
 impl From<&[u8]> for AnnounceResponse {
     fn from(value: &[u8]) -> Self {
+        let mut peer_addr_list = vec![];
+
+        let mut ip_pos = 20usize;
+        while ip_pos + 6 <= value.len() {
+            let ip = IP {
+                address: value[ip_pos..ip_pos + 4]
+                    .try_into()
+                    .expect("Cannot extract IP"),
+                port: u16::from_be_bytes(
+                    value[ip_pos + 4..ip_pos + 6]
+                        .try_into()
+                        .expect("Cannot extract port"),
+                ),
+            };
+
+            if ip.is_empty() {
+                break;
+            }
+
+            peer_addr_list.push(ip);
+            ip_pos += 6;
+        }
+
         Self {
             transaction_id: u32::from_be_bytes(value[4..8].try_into().expect("Failed bytes: 4..8")),
             interval: u32::from_be_bytes(value[8..12].try_into().expect("Failed bytes: 8..12")),
             leechers: u32::from_be_bytes(value[12..16].try_into().expect("Failed bytes: 12..16")),
             seeders: u32::from_be_bytes(value[16..20].try_into().expect("Failed bytes: 16..20")),
+            peer_addr_list: peer_addr_list,
         }
     }
 }
@@ -243,7 +289,7 @@ impl Tracker {
         to_buf!(ACTION_ANNOUNCE, buf);
         to_buf!(transaction_id, buf);
         vec_to_buf!(&self.info_hash, buf);
-        vec_to_buf!(&PEER_ID.bytes().collect::<Vec<u8>>(), buf);
+        vec_to_buf!(&PEER_ID[..], buf);
         to_buf!(0u64, buf); // FIXME: Set downloaded to a real value.
         to_buf!(self.info.len as u64, buf);
         to_buf!(0u64, buf); // FIXME: Set uploaded to a real value.
@@ -288,6 +334,34 @@ impl Tracker {
         }
         panic!("Failed having announcement success response")
     }
+
+    async fn handshake(&self, ip: &IP) {
+        let mut stream = TcpStream::connect(ip.socket_addr())
+            .await
+            .expect("Cannot reserve TCP stream");
+
+        let mut buf: Vec<u8> = vec![];
+        let pstr = b"BitTorrent protocol";
+
+        to_buf!(pstr.len() as u8, buf);
+        vec_to_buf!(pstr, buf);
+        vec_to_buf!(&[0u8; 8][..], buf);
+        vec_to_buf!(&self.info_hash[..], buf);
+        vec_to_buf!(&PEER_ID[..], buf);
+        assert_eq!(49 + pstr.len(), buf.len());
+
+        log::info!("Handshake init with: {:?}", ip);
+        stream.write(&buf[..]).await.expect("Cannot send handshake");
+        log::info!("Handshake sent");
+
+        let mut response_buf: [u8; 1024] = [0; 1024];
+        let response_len = stream
+            .try_read(&mut response_buf)
+            .expect("Failed getting handshake response");
+
+        log::info!("Handshake reponse: {} bytes", response_len);
+        dbg!(&response_buf[..32]);
+    }
 }
 
 #[tokio::main]
@@ -307,6 +381,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let announce_response = tracker
         .announce(&socket, connection_response.connection_id)
         .await;
+
+    let tracker_mtx = Arc::new(Mutex::new(tracker));
+
+    let mut thread_handlers = vec![];
+    for peer_addr in announce_response.peer_addr_list {
+        let peer_addr = peer_addr.clone();
+        let tracker_mtx_clone = tracker_mtx.clone();
+        let thread_handle = spawn(async move {
+            let tracker_lock = tracker_mtx_clone.lock().await;
+            tracker_lock.handshake(&peer_addr).await;
+        });
+        thread_handlers.push(thread_handle);
+    }
+
+    for thread_handler in thread_handlers {
+        thread_handler
+            .await
+            .expect("Failed finishing handshake thread");
+    }
 
     Ok(())
 }

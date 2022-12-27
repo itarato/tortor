@@ -2,12 +2,7 @@ use std::error::Error;
 
 use crate::byte_reader::*;
 use crate::stable_hash_map::*;
-
-#[derive(Debug)]
-pub struct IP {
-    pub address: [u8; 4],
-    pub port: u16,
-}
+use crate::IP;
 
 #[derive(Debug)]
 pub enum BenType {
