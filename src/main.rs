@@ -7,12 +7,9 @@ use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc};
+use std::{error::Error, fs::File, io::{Read, Write}, net::{SocketAddr, TcpStream}, sync::{Arc, Mutex}, thread::spawn};
 use tokio::{
-    io::AsyncWriteExt,
-    net::{TcpStream, UdpSocket},
-    spawn,
-    sync::Mutex,
+    net::UdpSocket,
 };
 
 use crate::ben_type::*;
@@ -234,11 +231,6 @@ impl Tracker {
     }
 
     async fn connect(&self, socket: &UdpSocket) -> ConnectResponse {
-        socket
-            .connect(self.announce_addr())
-            .await
-            .expect("Can connect to peer");
-
         let mut buf: Vec<u8> = vec![];
 
         let mut rng = rand::thread_rng();
@@ -248,7 +240,7 @@ impl Tracker {
         to_buf!(ACTION_CONNECT, buf);
         to_buf!(transaction_id, buf);
 
-        log::info!("Connection request start");
+        log::info!("Connection request start to {}", self.announce_addr());
         socket
             .send_to(&buf, self.announce_addr())
             .await
@@ -274,11 +266,6 @@ impl Tracker {
     }
 
     async fn announce(&self, socket: &UdpSocket, connection_id: u64) -> AnnounceResponse {
-        socket
-            .connect(self.announce_addr())
-            .await
-            .expect("Can connect to peer");
-
         let mut buf: Vec<u8> = vec![];
 
         let mut rng = rand::thread_rng();
@@ -334,34 +321,35 @@ impl Tracker {
         }
         panic!("Failed having announcement success response")
     }
+}
 
-    async fn handshake(&self, ip: &IP) {
-        let mut stream = TcpStream::connect(ip.socket_addr())
-            .await
-            .expect("Cannot reserve TCP stream");
+fn handshake(ip: &IP, info_hash: Arc<Vec<u8>>) {
+    let mut stream = TcpStream::connect(ip.socket_addr())
+        .expect("Cannot reserve TCP stream");
 
-        let mut buf: Vec<u8> = vec![];
-        let pstr = b"BitTorrent protocol";
+    stream.set_ttl(3).expect("Cannot set TCP IP TTL");
 
-        to_buf!(pstr.len() as u8, buf);
-        vec_to_buf!(pstr, buf);
-        vec_to_buf!(&[0u8; 8][..], buf);
-        vec_to_buf!(&self.info_hash[..], buf);
-        vec_to_buf!(&PEER_ID[..], buf);
-        assert_eq!(49 + pstr.len(), buf.len());
+    let mut buf: Vec<u8> = vec![];
+    let pstr = b"BitTorrent protocol";
 
-        log::info!("Handshake init with: {:?}", ip);
-        stream.write(&buf[..]).await.expect("Cannot send handshake");
-        log::info!("Handshake sent");
+    to_buf!(pstr.len() as u8, buf);
+    vec_to_buf!(pstr, buf);
+    vec_to_buf!(&[0u8; 8][..], buf);
+    vec_to_buf!(&info_hash[..], buf);
+    vec_to_buf!(&PEER_ID[..], buf);
+    assert_eq!(49 + pstr.len(), buf.len());
 
-        let mut response_buf: [u8; 1024] = [0; 1024];
-        let response_len = stream
-            .try_read(&mut response_buf)
-            .expect("Failed getting handshake response");
+    log::info!("Handshake init with: {:?}", ip);
+    stream.write(&buf[..]).expect("Cannot send handshake");
+    log::info!("Handshake sent");
 
-        log::info!("Handshake reponse: {} bytes", response_len);
-        dbg!(&response_buf[..32]);
-    }
+    let mut response_buf: [u8; 1024] = [0; 1024];
+    let response_len = stream
+        .read(&mut response_buf)
+        .expect("Failed getting handshake response");
+
+    log::info!("Handshake reponse: {} bytes", response_len);
+    dbg!(&response_buf[..32]);
 }
 
 #[tokio::main]
@@ -382,23 +370,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .announce(&socket, connection_response.connection_id)
         .await;
 
-    let tracker_mtx = Arc::new(Mutex::new(tracker));
-
     let mut thread_handlers = vec![];
+    let info_hash = Arc::new(tracker.info_hash.clone());
     for peer_addr in announce_response.peer_addr_list {
         let peer_addr = peer_addr.clone();
-        let tracker_mtx_clone = tracker_mtx.clone();
-        let thread_handle = spawn(async move {
-            let tracker_lock = tracker_mtx_clone.lock().await;
-            tracker_lock.handshake(&peer_addr).await;
+        let info_hash_ref = info_hash.clone();
+        let thread_handle = spawn(move || {
+            log::info!("Thread spawn for {:?}", &peer_addr);
+            handshake(&peer_addr, info_hash_ref);
         });
         thread_handlers.push(thread_handle);
     }
 
     for thread_handler in thread_handlers {
-        thread_handler
-            .await
-            .expect("Failed finishing handshake thread");
+        thread_handler.join().expect("Cannot join thread");
     }
 
     Ok(())
