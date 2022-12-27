@@ -10,7 +10,7 @@ use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::{Read}, net::{SocketAddr, TcpStream}, sync::{Arc, Mutex}, thread::spawn};
+use std::{error::Error, fs::File, io::{Read}, net::{SocketAddr}, sync::{Arc}, thread::spawn};
 use tokio::{
     net::UdpSocket,
 };
@@ -19,6 +19,9 @@ use crate::ben_type::*;
 use crate::macros::*;
 use crate::defs::*;
 use crate::peer::*;
+
+#[macro_use]
+extern crate num_derive;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -324,7 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let info_hash_ref = info_hash.clone();
         let mut peer = Peer::new(peer_addr, info_hash_ref);
         let thread_handle = spawn(move || {
-            log::info!("Thread spawn");
+            log::info!("Thread spawn for peer execution");
             peer.exec();
         });
         thread_handlers.push(thread_handle);
