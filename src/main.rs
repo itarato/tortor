@@ -1,48 +1,24 @@
 mod ben_type;
 mod byte_reader;
 mod stable_hash_map;
+mod peer;
+mod macros;
+mod defs;
 
 use byte_reader::ByteReader;
 use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::{Read, Write}, net::{SocketAddr, TcpStream}, sync::{Arc, Mutex}, thread::spawn};
+use std::{error::Error, fs::File, io::{Read}, net::{SocketAddr, TcpStream}, sync::{Arc, Mutex}, thread::spawn};
 use tokio::{
     net::UdpSocket,
 };
 
 use crate::ben_type::*;
-
-macro_rules! to_buf {
-    ($e: expr, $i: ident) => {
-        for b in $e.to_be_bytes() {
-            $i.push(b);
-        }
-    };
-}
-
-macro_rules! vec_to_buf {
-    ($e: expr, $i: ident) => {
-        for b in $e {
-            $i.push(*b);
-        }
-    };
-}
-
-static LOCAL_SOCKET_ADDR: &'static str = "0.0.0.0:6881";
-static LOCAL_PORT: u16 = 6881;
-static PEER_ID: &'static [u8; 20] = b"M0-0-1--IT2022------";
-static CONNECT_MAGIC_NUMBER: u64 = 0x41727101980;
-static ACTION_CONNECT: u32 = 0;
-static ACTION_ANNOUNCE: u32 = 1;
-static ACTION_SCRAPE: u32 = 2;
-static ACTION_ERROR: u32 = 3;
-static ANNOUNCE_EVENT_NONE: u32 = 0;
-static ANNOUNCE_EVENT_COMPLETED: u32 = 1;
-static ANNOUNCE_EVENT_STARTED: u32 = 2;
-static ANNOUNCE_EVENT_STOPPED: u32 = 3;
-static MAX_PEERS: i32 = 8;
+use crate::macros::*;
+use crate::defs::*;
+use crate::peer::*;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -323,35 +299,6 @@ impl Tracker {
     }
 }
 
-fn handshake(ip: &IP, info_hash: Arc<Vec<u8>>) {
-    let mut stream = TcpStream::connect(ip.socket_addr())
-        .expect("Cannot reserve TCP stream");
-
-    stream.set_ttl(3).expect("Cannot set TCP IP TTL");
-
-    let mut buf: Vec<u8> = vec![];
-    let pstr = b"BitTorrent protocol";
-
-    to_buf!(pstr.len() as u8, buf);
-    vec_to_buf!(pstr, buf);
-    vec_to_buf!(&[0u8; 8][..], buf);
-    vec_to_buf!(&info_hash[..], buf);
-    vec_to_buf!(&PEER_ID[..], buf);
-    assert_eq!(49 + pstr.len(), buf.len());
-
-    log::info!("Handshake init with: {:?}", ip);
-    stream.write(&buf[..]).expect("Cannot send handshake");
-    log::info!("Handshake sent");
-
-    let mut response_buf: [u8; 1024] = [0; 1024];
-    let response_len = stream
-        .read(&mut response_buf)
-        .expect("Failed getting handshake response");
-
-    log::info!("Handshake reponse: {} bytes", response_len);
-    dbg!(&response_buf[..32]);
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     SimpleLogger::new()
@@ -375,9 +322,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for peer_addr in announce_response.peer_addr_list {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
+        let mut peer = Peer::new(peer_addr, info_hash_ref);
         let thread_handle = spawn(move || {
-            log::info!("Thread spawn for {:?}", &peer_addr);
-            handshake(&peer_addr, info_hash_ref);
+            log::info!("Thread spawn");
+            peer.exec();
         });
         thread_handlers.push(thread_handle);
     }
