@@ -323,7 +323,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for peer_addr in announce_response.peer_addr_list {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
-        let mut peer = Peer::new(peer_addr, info_hash_ref);
+        let peer = Peer::try_new(peer_addr, info_hash_ref);
+
+        if peer.is_err() {
+            log::error!("Cannot init peer");
+            continue;
+        }
+        let mut peer = peer.unwrap();
+
         let thread_handle = spawn(move || {
             log::info!("Thread spawn for peer execution");
             peer.exec();
@@ -332,7 +339,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for thread_handler in thread_handlers {
-        let thread_res = thread_handler.join();
+        match thread_handler.join() {
+            Ok(_) => (),
+            Err(err) => {
+                log::error!("Thread join error: {:?}", err);
+            }
+        };
     }
 
     Ok(())
