@@ -1,23 +1,21 @@
 mod ben_type;
 mod byte_reader;
-mod stable_hash_map;
-mod peer;
-mod macros;
 mod defs;
+mod macros;
+mod peer;
+mod stable_hash_map;
 
 use byte_reader::ByteReader;
 use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::{Read}, net::{SocketAddr}, sync::{Arc}, thread::spawn};
-use tokio::{
-    net::UdpSocket,
-};
+use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc, thread::spawn};
+use tokio::net::UdpSocket;
 
 use crate::ben_type::*;
-use crate::macros::*;
 use crate::defs::*;
+use crate::macros::*;
 use crate::peer::*;
 
 #[macro_use]
@@ -334,7 +332,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for thread_handler in thread_handlers {
-        thread_handler.join().expect("Cannot join thread");
+        let thread_res = thread_handler.join();
     }
 
     Ok(())
