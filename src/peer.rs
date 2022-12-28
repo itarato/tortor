@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener};
+use std::time::Duration;
 use std::{net::TcpStream, sync::Arc};
 
 use num_traits::{FromPrimitive, ToPrimitive};
@@ -119,6 +120,14 @@ impl Peer {
         log::info!("Handshake init with: {:?}", self.ip);
         self.stream.write(&buf[..]).expect("Cannot send handshake");
         log::info!("Handshake sent");
+
+        self.stream.set_read_timeout(Some(Duration::new(3, 0)))?;
+
+        let mut resp_buf: Vec<u8> = vec![];
+        self.stream.read(&mut resp_buf)?;
+
+        log::info!("Got handshake response");
+        dbg!(resp_buf);
 
         Ok(())
     }

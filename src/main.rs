@@ -323,16 +323,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     for peer_addr in announce_response.peer_addr_list {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
-        let peer = Peer::try_new(peer_addr, info_hash_ref);
-
-        if peer.is_err() {
-            log::error!("Cannot init peer");
-            continue;
-        }
-        let mut peer = peer.unwrap();
 
         let thread_handle = spawn(move || {
+            let peer = Peer::try_new(peer_addr, info_hash_ref);
+            if peer.is_err() {
+                log::error!("Cannot init peer");
+                return;
+            }
+            let mut peer = peer.unwrap();
+
             log::info!("Thread spawn for peer execution");
+
             peer.exec();
         });
         thread_handlers.push(thread_handle);

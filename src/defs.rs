@@ -10,4 +10,4 @@ pub static ANNOUNCE_EVENT_NONE: u32 = 0;
 pub static ANNOUNCE_EVENT_COMPLETED: u32 = 1;
 pub static ANNOUNCE_EVENT_STARTED: u32 = 2;
 pub static ANNOUNCE_EVENT_STOPPED: u32 = 3;
-pub static MAX_PEERS: i32 = 8;
+pub static MAX_PEERS: i32 = 16;
