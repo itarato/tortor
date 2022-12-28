@@ -10,8 +10,9 @@ use clap::Parser;
 use rand::Rng;
 use sha1::{Digest, Sha1};
 use simple_logger::SimpleLogger;
-use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc, thread::spawn};
+use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
+use tokio::spawn;
 
 use crate::ben_type::*;
 use crate::defs::*;
@@ -324,23 +325,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
 
-        let thread_handle = spawn(move || {
-            let peer = Peer::try_new(peer_addr, info_hash_ref);
-            if peer.is_err() {
-                log::error!("Cannot init peer");
-                return;
-            }
-            let mut peer = peer.unwrap();
-
+        let thread_handle = spawn(async move {
             log::info!("Thread spawn for peer execution");
 
-            peer.exec();
+            match Peer::try_new(peer_addr, info_hash_ref).await {
+                Ok(mut peer) => {
+                    peer.exec().await;
+                }
+                Err(err) => {
+                    log::error!("Cannot init peer: {:?}", err);
+                }
+            };
         });
         thread_handlers.push(thread_handle);
     }
 
     for thread_handler in thread_handlers {
-        match thread_handler.join() {
+        match thread_handler.await {
             Ok(_) => (),
             Err(err) => {
                 log::error!("Thread join error: {:?}", err);

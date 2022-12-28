@@ -1,10 +1,12 @@
 use std::error::Error;
-use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpListener};
+use std::io::{self, Read, Write};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
-use std::{net::TcpStream, sync::Arc};
 
 use num_traits::{FromPrimitive, ToPrimitive};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::defs::*;
 use crate::macros::*;
@@ -50,41 +52,40 @@ pub struct Peer {
 }
 
 impl Peer {
-    pub fn try_new(ip: IP, info_hash: Arc<Vec<u8>>) -> Result<Self, Box<dyn Error>> {
-        let addr = ip.socket_addr();
-
-        Ok(Self {
-            ip,
-            info_hash,
-            is_interested: false,
-            is_choked: true,
-            stream: TcpStream::connect(addr)?,
-        })
+    pub async fn try_new(ip: IP, info_hash: Arc<Vec<u8>>) -> Result<Self, io::Error> {
+        TcpStream::connect(ip.socket_addr())
+            .await
+            .map(|stream| Self {
+                ip,
+                info_hash,
+                is_interested: false,
+                is_choked: true,
+                stream,
+            })
     }
 
-    pub fn exec(&mut self) {
+    pub async fn exec(&mut self) {
         let listener = TcpListener::bind(
             self.stream
                 .local_addr()
                 .expect("Cannot obtain the local stream addr"),
         )
+        .await
         .expect("Cannot establish local TCP listener");
 
         log::info!("Peer listens on {:?}", self.stream.local_addr());
 
-        match self.handshake() {
-            Ok(_) => {
-                for stream_res in listener.incoming() {
-                    match stream_res {
-                        Ok(stream) => self.handle_incoming(stream),
-                        Err(err) => {
-                            log::error!("TcpListener error: {:?}", err);
-                            break;
-                        }
+        match self.handshake().await {
+            Ok(_) => loop {
+                match listener.accept().await {
+                    Ok((stream_res, addr)) => self.handle_incoming(stream_res, addr).await,
+                    Err(err) => {
+                        log::error!("TcpListener error: {:?}", err);
+                        break;
                     }
-                    break;
                 }
-            }
+                break;
+            },
             Err(err) => {
                 log::error!("Handshake error: {:?}", err);
             }
@@ -93,10 +94,10 @@ impl Peer {
         log::info!("Peer closing");
     }
 
-    fn handle_incoming(&mut self, mut stream: TcpStream) {
+    async fn handle_incoming(&mut self, mut stream: TcpStream, addr: SocketAddr) {
         let mut buf: [u8; MSG_BUF_SIZE] = [0; MSG_BUF_SIZE];
 
-        match stream.read(&mut buf) {
+        match stream.read(&mut buf).await {
             Ok(size) => {
                 log::info!("Incoming peer msg: {} bytes", size);
                 dbg!(&buf[..32]);
@@ -107,7 +108,7 @@ impl Peer {
         };
     }
 
-    pub fn handshake(&mut self) -> Result<(), Box<dyn Error>> {
+    pub async fn handshake(&mut self) -> Result<(), io::Error> {
         let mut buf: Vec<u8> = vec![];
 
         to_buf!(HANDSHAKE_PSTR.len() as u8, buf);
@@ -118,13 +119,18 @@ impl Peer {
         assert_eq!(49 + HANDSHAKE_PSTR.len(), buf.len());
 
         log::info!("Handshake init with: {:?}", self.ip);
-        self.stream.write(&buf[..]).expect("Cannot send handshake");
+        self.stream
+            .write(&buf[..])
+            .await
+            .expect("Cannot send handshake");
         log::info!("Handshake sent");
 
-        self.stream.set_read_timeout(Some(Duration::new(3, 0)))?;
+        // self.stream.set_read_timeout(Some(Duration::new(3, 0)))?;
 
         let mut resp_buf: Vec<u8> = vec![];
-        self.stream.read(&mut resp_buf)?;
+
+        log::info!("Handshake waiting for response");
+        self.stream.read(&mut resp_buf).await?;
 
         log::info!("Got handshake response");
         dbg!(resp_buf);
