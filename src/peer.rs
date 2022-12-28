@@ -59,7 +59,7 @@ impl Peer {
         match handshake_res {
             Ok(PeerMessage::KeepAlive) => {
                 if self.is_choked {
-                    let choke_res = self.unchoke();
+                    let interested_res = self.interested();
                 } else {
                     unimplemented!("Handshake is keep-alive but peer is already unchoked.")
                 }
@@ -123,7 +123,7 @@ impl Peer {
         assert_eq!(5, buf.len());
 
         log::info!("Unchoke init with: {:?}", self.ip);
-        stream.write(&buf[..]).expect("Cannot send handshake");
+        stream.write(&buf[..]).expect("Cannot send unchoke");
         log::info!("Unchoke sent");
 
         let mut response_buf: [u8; 1024] = [0; 1024];
@@ -140,8 +140,41 @@ impl Peer {
             .try_into()
             .map_err(|_| "No bytes for peer message code")?;
         match peer_msg_code {
+            _ => unimplemented!("Unchoke response is not handled yet: {:?}", &peer_msg_code),
+        }
+    }
+
+    pub fn interested(&mut self) -> Result<PeerMessage, Box<dyn Error>> {
+        let mut stream = TcpStream::connect(self.ip.socket_addr())?;
+
+        stream.set_ttl(3).expect("Cannot set TCP IP TTL");
+
+        let mut buf: Vec<u8> = vec![];
+
+        to_buf!(1u32, buf); // Len.
+        to_buf!(2u8 as u8, buf); // Interested.
+        assert_eq!(5, buf.len());
+
+        log::info!("Interested init with: {:?}", self.ip);
+        stream.write(&buf[..]).expect("Cannot send interested");
+        log::info!("Interested sent");
+
+        let mut response_buf: [u8; 1024] = [0; 1024];
+        let response_len = stream.read(&mut response_buf)?;
+
+        log::info!("Interested reponse: {} bytes", response_len);
+        dbg!(&response_buf[..32]);
+
+        if response_len == 0 {
+            return Ok(PeerMessage::KeepAlive);
+        }
+
+        let peer_msg_code: PeerMessageCode = response_buf[..]
+            .try_into()
+            .map_err(|_| "No bytes for peer message code")?;
+        match peer_msg_code {
             _ => unimplemented!(
-                "Handshake response is not handled yet: {:?}",
+                "Interested response is not handled yet: {:?}",
                 &peer_msg_code
             ),
         }
