@@ -321,14 +321,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut thread_handlers = vec![];
     let info_hash = Arc::new(tracker.info_hash.clone());
-    for peer_addr in announce_response.peer_addr_list {
+    for (idx, peer_addr) in announce_response.peer_addr_list.iter().enumerate() {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
 
         let thread_handle = spawn(async move {
             log::info!("Thread spawn for peer execution");
 
-            match Peer::try_new(peer_addr, info_hash_ref).await {
+            match Peer::try_new(idx, peer_addr, info_hash_ref).await {
                 Ok(mut peer) => {
                     peer.exec().await;
                 }
