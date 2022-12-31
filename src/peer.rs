@@ -53,15 +53,19 @@ impl MessageBuf {
         self.end = 0;
     }
 
-    fn set_start(&mut self, pos: usize) {
-        self.start = pos;
+    fn consume_message(&mut self, delta: usize) {
+        assert!(
+            delta <= self.end - self.start,
+            "Consumed more than available"
+        );
+        self.start += delta;
     }
 
     fn register_read_len(&mut self, read_len: usize) {
         self.end += read_len;
     }
 
-    fn ensure_read_capacity(&mut self) {
+    pub fn ensure_read_capacity(&mut self) {
         if self.start == self.end && self.start > 0 {
             self.clear();
             return;
@@ -115,8 +119,7 @@ pub struct Peer {
     idx: usize,
     ip: IP,
     info_hash: Arc<Vec<u8>>,
-    is_interested: bool,
-    is_choked: bool,
+    // is_choked: bool,
     stream: TcpStream,
     read_buffer: MessageBuf,
 }
@@ -129,24 +132,13 @@ impl Peer {
                 idx,
                 ip,
                 info_hash,
-                is_interested: false,
-                is_choked: true,
+                // is_choked: true,
                 stream,
                 read_buffer: MessageBuf::new_with_min_available(MSG_BUF_SIZE),
             })
     }
 
     pub async fn exec(&mut self) {
-        // let listener = TcpListener::bind(
-        //     self.stream
-        //         .local_addr()
-        //         .expect("Cannot obtain the local stream addr"),
-        // )
-        // .await
-        // .expect("Cannot establish local TCP listener");
-
-        log::info!("Peer listens on {:?}", self.stream.local_addr());
-
         let handshake_res = self.handshake().await;
         if handshake_res.is_err() {
             log::error!("Handshake error: {:?}", handshake_res);
@@ -154,8 +146,33 @@ impl Peer {
         }
 
         if !handshake_res.unwrap() {
-            log::warn!("Incorrect handshake");
+            log::warn!("Incorrect handshake response");
             return;
+        }
+
+        loop {
+            log::info!("Waiting for post-handshake message");
+            let res = self.read_one_message().await;
+
+            if res.is_ok() {
+                let last_msg = self.take_last_message();
+                log::info!("Got post-handshake message: {:?}", last_msg);
+
+                match last_msg {
+                    Some(PeerMessage::Bitfield(bitfields)) => {
+                        log::info!("{} Bitfields are in", self.idx);
+                        break;
+                    }
+                    None => {
+                        log::warn!("{} No post handshake message", self.idx);
+                        break;
+                    }
+                    _ => unimplemented!("Unhandled message: {:?}", last_msg),
+                }
+            } else {
+                log::warn!("Failed getting post-handshake message. Quitting work.");
+                break;
+            }
         }
 
         log::info!("Peer closing");
@@ -184,23 +201,25 @@ impl Peer {
         vec_to_buf!(&self.info_hash[..], buf);
         vec_to_buf!(&PEER_ID[..], buf);
 
-        let msg_len = 49 + HANDSHAKE_PSTR.len();
-
-        assert_eq!(msg_len, buf.len());
+        assert_eq!(self.handhake_len(), buf.len());
 
         log::info!("Handshake init with: {:?}", self.ip);
         self.stream.write_all(&buf[..]).await?;
         log::info!("Handshake sent");
 
-        self.read_one_message();
+        self.read_handshake().await?;
 
         log::info!("Handshake waiting for response");
         let resp_buf = self.read_buffer.current();
 
         log::info!("Got handshake response");
 
-        if resp_buf.len() < msg_len {
-            log::warn!("Handshake response is too small: {}", msg_len);
+        if resp_buf.len() < self.handhake_len() {
+            log::warn!(
+                "Handshake response is incorrect: {} != {}",
+                resp_buf.len(),
+                self.handhake_len()
+            );
             return Ok(false);
         }
 
@@ -210,26 +229,73 @@ impl Peer {
         }
 
         if resp_buf[1..1 + HANDSHAKE_PSTR.len()] != buf[1..1 + HANDSHAKE_PSTR.len()] {
-            log::warn!("Handske PSTR is not matching");
+            log::warn!("Handshake PSTR is not matching");
             return Ok(false);
         }
 
         if resp_buf[28..48] != buf[28..48] {
-            log::warn!("Handske info hash is not matching");
+            log::warn!("Handshake info hash is not matching");
             return Ok(false);
         }
+
+        self.read_buffer.consume_message(self.handhake_len());
 
         Ok(true)
     }
 
+    fn handhake_len(&self) -> usize {
+        49 + HANDSHAKE_PSTR.len()
+    }
+
     async fn read_one_message(&mut self) -> Result<(), io::Error> {
+        self.read_buffer.ensure_read_capacity();
+
         loop {
             if self.buffer_has_full_message() {
+                log::info!("{} got full message", self.idx);
                 break;
             }
 
+            log::info!(
+                "{} Waiting read into {} byte buf",
+                self.idx,
+                self.read_buffer.buffer().len()
+            );
             let read_len = self.stream.read(&mut self.read_buffer.buffer()).await?;
             self.read_buffer.register_read_len(read_len);
+            log::info!("{} Read {} bytes", self.idx, read_len);
+
+            if self.read_buffer.current().len() == 0 && read_len == 0 {
+                log::info!("{} Got Keep-Alive", self.idx);
+                break;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn read_handshake(&mut self) -> Result<(), io::Error> {
+        self.read_buffer.ensure_read_capacity();
+
+        loop {
+            if self.read_buffer.current().len() >= self.handhake_len() {
+                log::info!("{} got full handshake", self.idx);
+                break;
+            }
+
+            log::info!(
+                "{} Waiting read into {} byte buf",
+                self.idx,
+                self.read_buffer.buffer().len()
+            );
+            let read_len = self.stream.read(&mut self.read_buffer.buffer()).await?;
+            self.read_buffer.register_read_len(read_len);
+            log::info!("{} Read {} bytes", self.idx, read_len);
+
+            if self.read_buffer.current().len() == 0 && read_len == 0 {
+                log::info!("{} Got Keep-Alive", self.idx);
+                break;
+            }
         }
 
         Ok(())
@@ -240,11 +306,84 @@ impl Peer {
         if current.len() < 4
         /* u32 len + u8 action */
         {
+            log::info!("{} has {} bytes only", self.idx, current.len());
             return false;
         }
 
         let msg_len = u32::from_be_bytes(current[..4].try_into().unwrap()) as usize;
-        current.len() >= msg_len
+        log::info!(
+            "{} Msg is {} bytes and we got {} already",
+            self.idx,
+            msg_len,
+            current.len()
+        );
+        current.len() >= msg_len + 4
+    }
+
+    fn take_last_message(&mut self) -> Option<PeerMessage> {
+        let current = self.read_buffer.current();
+
+        if current.len() == 0 {
+            return Some(PeerMessage::KeepAlive);
+        }
+
+        if current.len() < 5 {
+            log::warn!("{} Invalid message len: {}", self.idx, current.len());
+            return None;
+        }
+
+        let msg_len = u32::from_be_bytes(current[..4].try_into().unwrap()) as usize;
+        let message_raw = &current[4..msg_len + 4];
+        assert_eq!(msg_len, message_raw.len());
+
+        match message_raw[0] {
+            0 => {
+                self.read_buffer.consume_message(5);
+                Some(PeerMessage::Choke)
+            }
+            1 => {
+                self.read_buffer.consume_message(5);
+                Some(PeerMessage::Unchoke)
+            }
+            2 => {
+                self.read_buffer.consume_message(5);
+                Some(PeerMessage::Interested)
+            }
+            3 => {
+                self.read_buffer.consume_message(5);
+                Some(PeerMessage::NotInterested)
+            }
+            4 => {
+                let piece = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
+                self.read_buffer.consume_message(9);
+                Some(PeerMessage::Have(piece))
+            }
+            5 => {
+                let bitfields = message_raw[1..msg_len - 1].to_vec();
+                Some(PeerMessage::Bitfield(bitfields))
+            }
+            6 => {
+                let index = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
+                let begin = u32::from_be_bytes(message_raw[5..9].try_into().unwrap());
+                let length = u32::from_be_bytes(message_raw[9..13].try_into().unwrap());
+                Some(PeerMessage::Request(index, begin, length))
+            }
+            7 => {
+                unimplemented!("Piece message is not implemented")
+                // Some(PeerMessage::Piece)
+            }
+            8 => {
+                let index = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
+                let begin = u32::from_be_bytes(message_raw[5..9].try_into().unwrap());
+                let length = u32::from_be_bytes(message_raw[9..13].try_into().unwrap());
+                Some(PeerMessage::Cancel(index, begin, length))
+            }
+            9 => {
+                let port = u16::from_be_bytes(message_raw[1..3].try_into().unwrap());
+                Some(PeerMessage::Port(port))
+            }
+            _ => unimplemented!("Message type {} not handled yet", message_raw[0]),
+        }
     }
 
     // pub fn unchoke(&mut self) -> Result<PeerMessage, Box<dyn Error>> {
@@ -313,16 +452,17 @@ impl Peer {
     // }
 }
 
+#[derive(Debug)]
 pub enum PeerMessage {
     KeepAlive,
     Choke,
     Unchoke,
     Interested,
     NotInterested,
-    Have,
-    Bitfield,
-    Request,
+    Have(u32),              // Piece index.
+    Bitfield(Vec<u8>),      // Bitfields.
+    Request(u32, u32, u32), // Index, begin, length.
     Piece,
-    Cancel,
-    Port,
+    Cancel(u32, u32, u32), // Index, begin, length.
+    Port(u16),             // Port.
 }
