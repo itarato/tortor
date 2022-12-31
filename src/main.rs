@@ -52,7 +52,7 @@ impl IP {
 #[derive(Debug)]
 struct AnnounceInfo {
     pieces: Vec<Vec<u8>>,
-    pieces_len: usize,
+    piece_len: usize,
     len: usize,
     name: String,
 }
@@ -178,7 +178,7 @@ impl Tracker {
                     .unwrap()
                     .try_into_pieces()
                     .unwrap(),
-                pieces_len: info
+                piece_len: info
                     .remove(&"piece length".to_owned())
                     .unwrap()
                     .try_into_int()
@@ -309,6 +309,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args = Args::parse();
     let tracker = Tracker::new(args.filename).expect("Torrent can be created");
+    log::info!("Tracker pieces len: {}", tracker.info.piece_len);
 
     let socket = UdpSocket::bind(LOCAL_SOCKET_ADDR)
         .await

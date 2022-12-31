@@ -150,47 +150,34 @@ impl Peer {
             return;
         }
 
-        loop {
-            log::info!("Waiting for post-handshake message");
-            let res = self.read_one_message().await;
+        log::info!("Waiting for post-handshake message");
+        let res = self.read_one_message().await;
 
-            if res.is_ok() {
-                let last_msg = self.take_last_message();
-                log::info!("Got post-handshake message: {:?}", last_msg);
+        if res.is_ok() {
+            let last_msg = self.take_last_message();
+            log::info!("Got post-handshake message: {:?}", last_msg);
 
-                match last_msg {
-                    Some(PeerMessage::Bitfield(bitfields)) => {
-                        log::info!("{} Bitfields are in", self.idx);
-                        break;
+            match last_msg {
+                Some(PeerMessage::Bitfield(bitfields)) => {
+                    // FIXME: use bitfields to know what is available
+                    log::info!("{} Bitfields are in", self.idx);
+
+                    match self.request().await {
+                        Ok(_) => log::info!("{} Got a piece", self.idx),
+                        Err(err) => log::error!("{} Error during piece fetch: {}", self.idx, err),
                     }
-                    None => {
-                        log::warn!("{} No post handshake message", self.idx);
-                        break;
-                    }
-                    _ => unimplemented!("Unhandled message: {:?}", last_msg),
                 }
-            } else {
-                log::warn!("Failed getting post-handshake message. Quitting work.");
-                break;
+                None => {
+                    log::warn!("{} No post handshake message", self.idx);
+                }
+                _ => unimplemented!("Unhandled message: {:?}", last_msg),
             }
+        } else {
+            log::warn!("Failed getting post-handshake message. Quitting work.");
         }
 
         log::info!("Peer closing");
     }
-
-    // async fn handle_incoming(&mut self, mut stream: TcpStream, addr: SocketAddr) {
-    //     let mut buf: [u8; MSG_BUF_SIZE] = [0; MSG_BUF_SIZE];
-
-    //     match stream.read(&mut buf).await {
-    //         Ok(size) => {
-    //             log::info!("Incoming peer msg: {} bytes", size);
-    //             dbg!(&buf[..32]);
-    //         }
-    //         Err(err) => {
-    //             log::error!("Incoming peer stream failure: {:?}", err);
-    //         }
-    //     };
-    // }
 
     pub async fn handshake(&mut self) -> Result<bool, io::Error> {
         let mut buf: Vec<u8> = vec![];
@@ -386,70 +373,28 @@ impl Peer {
         }
     }
 
-    // pub fn unchoke(&mut self) -> Result<PeerMessage, Box<dyn Error>> {
-    //     let mut buf: Vec<u8> = vec![];
+    pub async fn request(&mut self) -> Result<(), io::Error> {
+        let mut buf_in: Vec<u8> = vec![0; (1 << 14) + 32];
+        let mut buf_out: Vec<u8> = vec![];
 
-    //     to_buf!(1u32, buf); // Len.
-    //     to_buf!(1u8 as u8, buf); // Unchoke.
-    //     assert_eq!(5, buf.len());
+        to_buf!(13u32, buf_out);
+        to_buf!(6u8, buf_out);
+        to_buf!(0u32, buf_out);
+        to_buf!(0u32, buf_out);
+        to_buf!((1u32 << 14) as u32, buf_out);
 
-    //     log::info!("Unchoke init with: {:?}", self.ip);
-    //     self.stream.write(&buf[..]).expect("Cannot send unchoke");
-    //     log::info!("Unchoke sent");
+        log::info!("{} Request", self.idx);
+        self.stream.write_all(&mut buf_out).await?;
 
-    //     let mut response_buf: [u8; 1024] = [0; 1024];
-    //     let response_len = stream.read(&mut response_buf)?;
+        log::info!("{} Wait for piece", self.idx);
+        let read_len = self.stream.read(&mut buf_in).await?;
 
-    //     log::info!("Unchoke reponse: {} bytes", response_len);
-    //     dbg!(&response_buf[..32]);
+        dbg!(&buf_in[0..16.min(read_len)]);
 
-    //     if response_len == 0 {
-    //         return Ok(PeerMessage::KeepAlive);
-    //     }
+        assert_eq!((1 << 14) + 9, read_len, "Piece read len is incorrect");
 
-    //     let peer_msg_code: PeerMessageCode = response_buf[..]
-    //         .try_into()
-    //         .map_err(|_| "No bytes for peer message code")?;
-    //     match peer_msg_code {
-    //         _ => unimplemented!("Unchoke response is not handled yet: {:?}", &peer_msg_code),
-    //     }
-    // }
-
-    // pub fn interested(&mut self) -> Result<PeerMessage, Box<dyn Error>> {
-    //     let mut stream = TcpStream::connect(self.ip.socket_addr())?;
-
-    //     stream.set_ttl(3).expect("Cannot set TCP IP TTL");
-
-    //     let mut buf: Vec<u8> = vec![];
-
-    //     to_buf!(1u32, buf); // Len.
-    //     to_buf!(2u8 as u8, buf); // Interested.
-    //     assert_eq!(5, buf.len());
-
-    //     log::info!("Interested init with: {:?}", self.ip);
-    //     stream.write(&buf[..]).expect("Cannot send interested");
-    //     log::info!("Interested sent");
-
-    //     let mut response_buf: [u8; 1024] = [0; 1024];
-    //     let response_len = stream.read(&mut response_buf)?;
-
-    //     log::info!("Interested reponse: {} bytes", response_len);
-    //     dbg!(&response_buf[..32]);
-
-    //     if response_len == 0 {
-    //         return Ok(PeerMessage::KeepAlive);
-    //     }
-
-    //     let peer_msg_code: PeerMessageCode = response_buf[..]
-    //         .try_into()
-    //         .map_err(|_| "No bytes for peer message code")?;
-    //     match peer_msg_code {
-    //         _ => unimplemented!(
-    //             "Interested response is not handled yet: {:?}",
-    //             &peer_msg_code
-    //         ),
-    //     }
-    // }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
