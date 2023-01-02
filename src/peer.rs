@@ -1,8 +1,10 @@
+use std::error::Error;
 use std::io;
 use std::sync::Arc;
 
 use num_traits::FromPrimitive;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 
 use crate::defs::*;
@@ -14,7 +16,7 @@ const PIECE_SIZE: usize = 1 << 14;
 const MSG_BUF_SIZE: usize = PIECE_SIZE + 1024; // Some extra buffer in case multiple messages are coming in.
 
 #[derive(Debug)]
-struct MessageBuf {
+pub struct MessageBuf {
     buf: Vec<u8>,
     start: usize,
     end: usize,
@@ -115,9 +117,7 @@ impl TryFrom<&[u8]> for PeerMessageCode {
 
 enum PeerState {
     // Need to initiate handshake.
-    NeedMakeHandshake,
-    // Waiting for handshake to come back.
-    NeedReceiveHandshake,
+    NeedHandshake,
     // Need to unchoke itself.
     Choked,
     // Ready to send out requests for pieces and receive them.
@@ -130,71 +130,109 @@ pub struct Peer {
     idx: usize,
     ip: IP,
     info_hash: Arc<Vec<u8>>,
-    is_choked: bool,
-    reader: ReadHalf<TcpStream>,
-    writer: WriteHalf<TcpStream>,
-    read_buffer: MessageBuf,
 }
 
 impl Peer {
-    pub async fn try_new(idx: usize, ip: IP, info_hash: Arc<Vec<u8>>) -> Result<Self, io::Error> {
-        TcpStream::connect(ip.socket_addr()).await.map(|stream| {
-            let (reader, writer) = tokio::io::split(stream);
-
-            Self {
-                idx,
-                ip,
-                info_hash,
-                is_choked: true,
-                reader,
-                writer,
-                read_buffer: MessageBuf::new_with_min_available(MSG_BUF_SIZE),
-            }
-        })
+    pub fn new(idx: usize, ip: IP, info_hash: Arc<Vec<u8>>) -> Self {
+        Self { idx, ip, info_hash }
     }
 
-    pub async fn exec(&mut self) {
-        let handshake_res = self.handshake().await;
-        if handshake_res.is_err() {
-            log::error!("Handshake error: {:?}", handshake_res);
-            return;
-        }
+    pub async fn exec(&self) {
+        let mut state = PeerState::NeedHandshake;
 
-        if !handshake_res.unwrap() {
-            log::warn!("Incorrect handshake response");
-            return;
-        }
-
-        log::info!("Waiting for post-handshake message");
-        let res = self.read_one_message().await;
-
-        if res.is_ok() {
-            let last_msg = self.take_last_message();
-            log::info!("Got post-handshake message: {:?}", last_msg);
-
-            match last_msg {
-                Some(PeerMessage::Bitfield(bitfields)) => {
-                    // FIXME: use bitfields to know what is available
-                    log::info!("{} Bitfields are in", self.idx);
-
-                    match self.request().await {
-                        Ok(_) => log::info!("{} Got a piece", self.idx),
-                        Err(err) => log::error!("{} Error during piece fetch: {}", self.idx, err),
-                    }
-                }
-                None => {
-                    log::warn!("{} No post handshake message", self.idx);
-                }
-                _ => unimplemented!("Unhandled message: {:?}", last_msg),
+        let mut stream = match TcpStream::connect(self.ip.socket_addr()).await {
+            Ok(stream) => stream,
+            Err(err) => {
+                log::error!("{} Peer connection failed: {:?}", self.idx, err);
+                return;
             }
-        } else {
-            log::warn!("Failed getting post-handshake message. Quitting work.");
+        };
+
+        let mut read_buffer = MessageBuf::new_with_min_available(MSG_BUF_SIZE);
+
+        if let Err(err) = self.handshake(&mut stream, &mut read_buffer).await {
+            log::error!("Handshake error: {:?}", err);
+            return;
         }
+
+        state = PeerState::Choked;
+
+        let (mut reader, mut writer) = stream.split();
+
+        let writer_task = async move {
+            if Peer::interested(&mut writer).await.is_err() {
+                log::warn!("{} Failed sending interested message", self.idx);
+                return;
+            }
+
+            loop {
+                match state {
+                    PeerState::NeedHandshake => panic!("Unexpected state"),
+                    PeerState::Dead => break,
+                    PeerState::Pulling => {
+                        if Peer::request(&mut writer).await.is_err() {
+                            log::error!("{} Request message error", self.idx);
+                        }
+                        return;
+                    }
+                    PeerState::Choked => tokio::task::yield_now().await,
+                };
+            }
+        };
+
+        let reader_task = async move {
+            loop {
+                log::info!("{} Listening for incoming stream", self.idx);
+                // let res = self.read_one_message().await;
+
+                // if res.is_ok() {
+                //     let last_msg = self.take_last_message();
+                //     log::info!("Got post-handshake message: {:?}", last_msg);
+
+                //     match last_msg {
+                //         Some(PeerMessage::Bitfield(bitfields)) => {
+                //             // FIXME: use bitfields to know what is available
+                //             log::info!("{} Bitfields are in", self.idx);
+
+                //             match self.request().await {
+                //                 Ok(_) => log::info!("{} Got a piece", self.idx),
+                //                 Err(err) => {
+                //                     log::error!("{} Error during piece fetch: {}", self.idx, err)
+                //                 }
+                //             }
+                //         }
+                //         None => {
+                //             log::warn!("{} No post handshake message", self.idx);
+                //         }
+                //         _ => unimplemented!("Unhandled message: {:?}", last_msg),
+                //     }
+                // } else {
+                //     log::warn!("Failed getting post-handshake message. Quitting work.");
+                //     return;
+                // }
+
+                // match state {
+                //     PeerState::NeedMakeHandshake => panic!("Unexpected state"),
+                //     PeerState::NeedReceiveHandshake => panic!("Unexpected state"),
+                //     PeerState::Dead => break,
+                //     PeerState::Choked
+                // }
+            }
+        };
+
+        tokio::select! {
+            _ = writer_task => {}
+            _ = reader_task => {}
+        };
 
         log::info!("Peer closing");
     }
 
-    pub async fn handshake(&mut self) -> Result<bool, io::Error> {
+    pub async fn handshake(
+        &self,
+        stream: &mut TcpStream,
+        read_buffer: &mut MessageBuf,
+    ) -> Result<(), Box<dyn Error>> {
         let mut buf: Vec<u8> = vec![];
 
         to_buf!(HANDSHAKE_PSTR.len() as u8, buf);
@@ -206,13 +244,13 @@ impl Peer {
         assert_eq!(self.handhake_len(), buf.len());
 
         log::info!("Handshake init with: {:?}", self.ip);
-        self.writer.write_all(&buf[..]).await?;
+        stream.write_all(&buf[..]).await?;
         log::info!("Handshake sent");
 
-        self.read_handshake().await?;
+        self.read_handshake(stream, read_buffer).await?;
 
         log::info!("Handshake waiting for response");
-        let resp_buf = self.read_buffer.current();
+        let resp_buf = read_buffer.current();
 
         log::info!("Got handshake response");
 
@@ -222,38 +260,42 @@ impl Peer {
                 resp_buf.len(),
                 self.handhake_len()
             );
-            return Ok(false);
+            return Err("Incorrect handshake response".into());
         }
 
         if resp_buf[0] != HANDSHAKE_PSTR.len() as u8 {
             log::warn!("Handshake response PSTR len is incorrect: {}", resp_buf[0]);
-            return Ok(false);
+            return Err("Incorrect handshake response".into());
         }
 
         if resp_buf[1..1 + HANDSHAKE_PSTR.len()] != buf[1..1 + HANDSHAKE_PSTR.len()] {
             log::warn!("Handshake PSTR is not matching");
-            return Ok(false);
+            return Err("Incorrect handshake response".into());
         }
 
         if resp_buf[28..48] != buf[28..48] {
             log::warn!("Handshake info hash is not matching");
-            return Ok(false);
+            return Err("Incorrect handshake response".into());
         }
 
-        self.read_buffer.consume_message(self.handhake_len());
+        read_buffer.consume_message(self.handhake_len());
 
-        Ok(true)
+        Ok(())
     }
 
     fn handhake_len(&self) -> usize {
         49 + HANDSHAKE_PSTR.len()
     }
 
-    async fn read_one_message(&mut self) -> Result<(), io::Error> {
-        self.read_buffer.ensure_read_capacity();
+    async fn read_one_message(
+        &mut self,
+        stream: &mut ReadHalf<'_>,
+        read_buffer: &mut MessageBuf,
+    ) -> Result<(), io::Error> {
+        read_buffer.ensure_read_capacity();
 
         loop {
-            if self.buffer_has_full_message() {
+            if self.buffer_has_full_message(read_buffer) {
                 log::info!("{} got full message", self.idx);
                 break;
             }
@@ -261,13 +303,13 @@ impl Peer {
             log::info!(
                 "{} Waiting read into {} byte buf",
                 self.idx,
-                self.read_buffer.buffer().len()
+                read_buffer.buffer().len()
             );
-            let read_len = self.reader.read(&mut self.read_buffer.buffer()).await?;
-            self.read_buffer.register_read_len(read_len);
+            let read_len = stream.read(&mut read_buffer.buffer()).await?;
+            read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 
-            if self.read_buffer.current().len() == 0 && read_len == 0 {
+            if read_buffer.current().len() == 0 && read_len == 0 {
                 log::info!("{} Got Keep-Alive", self.idx);
                 break;
             }
@@ -276,11 +318,15 @@ impl Peer {
         Ok(())
     }
 
-    async fn read_handshake(&mut self) -> Result<(), io::Error> {
-        self.read_buffer.ensure_read_capacity();
+    async fn read_handshake(
+        &self,
+        stream: &mut TcpStream,
+        read_buffer: &mut MessageBuf,
+    ) -> Result<(), io::Error> {
+        read_buffer.ensure_read_capacity();
 
         loop {
-            if self.read_buffer.current().len() >= self.handhake_len() {
+            if read_buffer.current().len() >= self.handhake_len() {
                 log::info!("{} got full handshake", self.idx);
                 break;
             }
@@ -288,13 +334,13 @@ impl Peer {
             log::info!(
                 "{} Waiting read into {} byte buf",
                 self.idx,
-                self.read_buffer.buffer().len()
+                read_buffer.buffer().len()
             );
-            let read_len = self.reader.read(&mut self.read_buffer.buffer()).await?;
-            self.read_buffer.register_read_len(read_len);
+            let read_len = stream.read(&mut read_buffer.buffer()).await?;
+            read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 
-            if self.read_buffer.current().len() == 0 && read_len == 0 {
+            if read_buffer.current().len() == 0 && read_len == 0 {
                 log::info!("{} Got Keep-Alive", self.idx);
                 break;
             }
@@ -303,8 +349,8 @@ impl Peer {
         Ok(())
     }
 
-    fn buffer_has_full_message(&self) -> bool {
-        let current = self.read_buffer.current();
+    fn buffer_has_full_message(&self, read_buffer: &mut MessageBuf) -> bool {
+        let current = read_buffer.current();
         if current.len() < 4
         /* u32 len + u8 action */
         {
@@ -322,8 +368,8 @@ impl Peer {
         current.len() >= msg_len + 4
     }
 
-    fn take_last_message(&mut self) -> Option<PeerMessage> {
-        let current = self.read_buffer.current();
+    fn take_last_message(&mut self, read_buffer: &mut MessageBuf) -> Option<PeerMessage> {
+        let current = read_buffer.current();
 
         if current.len() == 0 {
             return Some(PeerMessage::KeepAlive);
@@ -340,24 +386,24 @@ impl Peer {
 
         match message_raw[0] {
             0 => {
-                self.read_buffer.consume_message(5);
+                read_buffer.consume_message(5);
                 Some(PeerMessage::Choke)
             }
             1 => {
-                self.read_buffer.consume_message(5);
+                read_buffer.consume_message(5);
                 Some(PeerMessage::Unchoke)
             }
             2 => {
-                self.read_buffer.consume_message(5);
+                read_buffer.consume_message(5);
                 Some(PeerMessage::Interested)
             }
             3 => {
-                self.read_buffer.consume_message(5);
+                read_buffer.consume_message(5);
                 Some(PeerMessage::NotInterested)
             }
             4 => {
                 let piece = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
-                self.read_buffer.consume_message(9);
+                read_buffer.consume_message(9);
                 Some(PeerMessage::Have(piece))
             }
             5 => {
@@ -388,8 +434,7 @@ impl Peer {
         }
     }
 
-    pub async fn request(&mut self) -> Result<(), io::Error> {
-        let mut buf_in: Vec<u8> = vec![0; (1 << 14) + 32];
+    pub async fn request(stream: &mut WriteHalf<'_>) -> Result<(), io::Error> {
         let mut buf_out: Vec<u8> = vec![];
 
         to_buf!(13u32, buf_out);
@@ -398,15 +443,20 @@ impl Peer {
         to_buf!(0u32, buf_out);
         to_buf!((1u32 << 14) as u32, buf_out);
 
-        log::info!("{} Request", self.idx);
-        self.writer.write_all(&mut buf_out).await?;
+        log::info!("Sent: request");
+        stream.write_all(&mut buf_out).await?;
 
-        log::info!("{} Wait for piece", self.idx);
-        let read_len = self.reader.read(&mut buf_in).await?;
+        Ok(())
+    }
 
-        dbg!(&buf_in[0..16.min(read_len)]);
+    pub async fn interested(stream: &mut WriteHalf<'_>) -> Result<(), io::Error> {
+        let mut buf_out: Vec<u8> = vec![];
 
-        assert_eq!((1 << 14) + 9, read_len, "Piece read len is incorrect");
+        to_buf!(1u32, buf_out);
+        to_buf!(2u8, buf_out);
+
+        log::info!("Sent: interested");
+        stream.write_all(&mut buf_out).await?;
 
         Ok(())
     }

@@ -329,14 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let thread_handle = spawn(async move {
             log::info!("Thread spawn for peer execution");
 
-            match Peer::try_new(idx, peer_addr, info_hash_ref).await {
-                Ok(mut peer) => {
-                    peer.exec().await;
-                }
-                Err(err) => {
-                    log::error!("Cannot init peer: {:?}", err);
-                }
-            };
+            Peer::new(idx, peer_addr, info_hash_ref).exec().await;
         });
         thread_handlers.push(thread_handle);
     }
