@@ -6,6 +6,7 @@ use num_traits::FromPrimitive;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
+use tokio::sync::Mutex;
 
 use crate::defs::*;
 use crate::macros::*;
@@ -138,7 +139,7 @@ impl Peer {
     }
 
     pub async fn exec(&self) {
-        let mut state = PeerState::NeedHandshake;
+        let state = Arc::new(Mutex::new(PeerState::NeedHandshake));
 
         let mut stream = match TcpStream::connect(self.ip.socket_addr()).await {
             Ok(stream) => stream,
@@ -151,13 +152,15 @@ impl Peer {
         let mut read_buffer = MessageBuf::new_with_min_available(MSG_BUF_SIZE);
 
         if let Err(err) = self.handshake(&mut stream, &mut read_buffer).await {
-            log::error!("Handshake error: {:?}", err);
+            log::error!("{} Handshake error: {:?}", self.idx, err);
             return;
         }
 
-        state = PeerState::Choked;
+        *(state.lock().await) = PeerState::Choked;
 
         let (mut reader, mut writer) = stream.split();
+        let reader_state = state.clone();
+        let writer_state = state;
 
         let writer_task = async move {
             if Peer::interested(&mut writer).await.is_err() {
@@ -166,7 +169,7 @@ impl Peer {
             }
 
             loop {
-                match state {
+                match *writer_state.lock().await {
                     PeerState::NeedHandshake => panic!("Unexpected state"),
                     PeerState::Dead => break,
                     PeerState::Pulling => {
@@ -175,7 +178,10 @@ impl Peer {
                         }
                         return;
                     }
-                    PeerState::Choked => tokio::task::yield_now().await,
+                    PeerState::Choked => {
+                        log::info!("{} Still in choked state - yielding", self.idx);
+                        tokio::task::yield_now().await;
+                    }
                 };
             }
         };
@@ -183,40 +189,41 @@ impl Peer {
         let reader_task = async move {
             loop {
                 log::info!("{} Listening for incoming stream", self.idx);
-                // let res = self.read_one_message().await;
 
-                // if res.is_ok() {
-                //     let last_msg = self.take_last_message();
-                //     log::info!("Got post-handshake message: {:?}", last_msg);
+                if let Err(err) = self.read_one_message(&mut reader, &mut read_buffer).await {
+                    log::error!("{} Peer message read error: {:?}", self.idx, err);
+                    *(reader_state.lock().await) = PeerState::Dead;
+                    return;
+                }
 
-                //     match last_msg {
-                //         Some(PeerMessage::Bitfield(bitfields)) => {
-                //             // FIXME: use bitfields to know what is available
-                //             log::info!("{} Bitfields are in", self.idx);
+                let last_msg = self.take_last_message(&mut read_buffer);
+                log::info!("{} Got post-handshake message: {:?}", self.idx, last_msg);
 
-                //             match self.request().await {
-                //                 Ok(_) => log::info!("{} Got a piece", self.idx),
-                //                 Err(err) => {
-                //                     log::error!("{} Error during piece fetch: {}", self.idx, err)
-                //                 }
-                //             }
-                //         }
-                //         None => {
-                //             log::warn!("{} No post handshake message", self.idx);
-                //         }
-                //         _ => unimplemented!("Unhandled message: {:?}", last_msg),
-                //     }
-                // } else {
-                //     log::warn!("Failed getting post-handshake message. Quitting work.");
-                //     return;
-                // }
-
-                // match state {
-                //     PeerState::NeedMakeHandshake => panic!("Unexpected state"),
-                //     PeerState::NeedReceiveHandshake => panic!("Unexpected state"),
-                //     PeerState::Dead => break,
-                //     PeerState::Choked
-                // }
+                match last_msg {
+                    Some(PeerMessage::Bitfield(bitfields)) => {
+                        // FIXME: use bitfields to know what is available
+                        log::info!("{} Bitfields are in", self.idx);
+                        *(reader_state.lock().await) = PeerState::Pulling;
+                    }
+                    Some(PeerMessage::KeepAlive) => {
+                        log::info!("{} KeepAlive", self.idx);
+                        tokio::task::yield_now().await;
+                    }
+                    None => {
+                        log::error!("{} Invalid post handshake message", self.idx);
+                        *(reader_state.lock().await) = PeerState::Dead;
+                        return;
+                    }
+                    _ => {
+                        log::error!(
+                            "{} Message type not supported yet: {:?}",
+                            self.idx,
+                            last_msg
+                        );
+                        *(reader_state.lock().await) = PeerState::Dead;
+                        return;
+                    }
+                }
             }
         };
 
@@ -225,7 +232,7 @@ impl Peer {
             _ = reader_task => {}
         };
 
-        log::info!("Peer closing");
+        log::info!("{} Peer closing", self.idx);
     }
 
     pub async fn handshake(
@@ -288,7 +295,7 @@ impl Peer {
     }
 
     async fn read_one_message(
-        &mut self,
+        &self,
         stream: &mut ReadHalf<'_>,
         read_buffer: &mut MessageBuf,
     ) -> Result<(), io::Error> {
@@ -368,7 +375,7 @@ impl Peer {
         current.len() >= msg_len + 4
     }
 
-    fn take_last_message(&mut self, read_buffer: &mut MessageBuf) -> Option<PeerMessage> {
+    fn take_last_message(&self, read_buffer: &mut MessageBuf) -> Option<PeerMessage> {
         let current = read_buffer.current();
 
         if current.len() == 0 {
@@ -384,26 +391,13 @@ impl Peer {
         let message_raw = &current[4..msg_len + 4];
         assert_eq!(msg_len, message_raw.len());
 
-        match message_raw[0] {
-            0 => {
-                read_buffer.consume_message(5);
-                Some(PeerMessage::Choke)
-            }
-            1 => {
-                read_buffer.consume_message(5);
-                Some(PeerMessage::Unchoke)
-            }
-            2 => {
-                read_buffer.consume_message(5);
-                Some(PeerMessage::Interested)
-            }
-            3 => {
-                read_buffer.consume_message(5);
-                Some(PeerMessage::NotInterested)
-            }
+        let message = match message_raw[0] {
+            0 => Some(PeerMessage::Choke),
+            1 => Some(PeerMessage::Unchoke),
+            2 => Some(PeerMessage::Interested),
+            3 => Some(PeerMessage::NotInterested),
             4 => {
                 let piece = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
-                read_buffer.consume_message(9);
                 Some(PeerMessage::Have(piece))
             }
             5 => {
@@ -416,10 +410,7 @@ impl Peer {
                 let length = u32::from_be_bytes(message_raw[9..13].try_into().unwrap());
                 Some(PeerMessage::Request(index, begin, length))
             }
-            7 => {
-                unimplemented!("Piece message is not implemented")
-                // Some(PeerMessage::Piece)
-            }
+            7 => Some(PeerMessage::Piece), // FIXME: keep content.
             8 => {
                 let index = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
                 let begin = u32::from_be_bytes(message_raw[5..9].try_into().unwrap());
@@ -431,7 +422,11 @@ impl Peer {
                 Some(PeerMessage::Port(port))
             }
             _ => unimplemented!("Message type {} not handled yet", message_raw[0]),
-        }
+        };
+
+        read_buffer.consume_message(4 + msg_len);
+
+        message
     }
 
     pub async fn request(stream: &mut WriteHalf<'_>) -> Result<(), io::Error> {
