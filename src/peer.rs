@@ -1,19 +1,17 @@
-use std::borrow::BorrowMut;
-use std::io::{self, Read};
-use std::net::SocketAddr;
-use std::pin::Pin;
+use std::io;
 use std::sync::Arc;
 
 use num_traits::FromPrimitive;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::net::TcpStream;
 
 use crate::defs::*;
 use crate::macros::*;
 use crate::IP;
 
 const HANDSHAKE_PSTR: &'static [u8; 19] = b"BitTorrent protocol";
-const MSG_BUF_SIZE: usize = 1024;
+const PIECE_SIZE: usize = 1 << 14;
+const MSG_BUF_SIZE: usize = PIECE_SIZE + 1024; // Some extra buffer in case multiple messages are coming in.
 
 #[derive(Debug)]
 struct MessageBuf {
@@ -115,27 +113,44 @@ impl TryFrom<&[u8]> for PeerMessageCode {
     }
 }
 
+enum PeerState {
+    // Need to initiate handshake.
+    NeedMakeHandshake,
+    // Waiting for handshake to come back.
+    NeedReceiveHandshake,
+    // Need to unchoke itself.
+    Choked,
+    // Ready to send out requests for pieces and receive them.
+    Pulling,
+    // Completed.
+    Dead,
+}
+
 pub struct Peer {
     idx: usize,
     ip: IP,
     info_hash: Arc<Vec<u8>>,
-    // is_choked: bool,
-    stream: TcpStream,
+    is_choked: bool,
+    reader: ReadHalf<TcpStream>,
+    writer: WriteHalf<TcpStream>,
     read_buffer: MessageBuf,
 }
 
 impl Peer {
     pub async fn try_new(idx: usize, ip: IP, info_hash: Arc<Vec<u8>>) -> Result<Self, io::Error> {
-        TcpStream::connect(ip.socket_addr())
-            .await
-            .map(|stream| Self {
+        TcpStream::connect(ip.socket_addr()).await.map(|stream| {
+            let (reader, writer) = tokio::io::split(stream);
+
+            Self {
                 idx,
                 ip,
                 info_hash,
-                // is_choked: true,
-                stream,
+                is_choked: true,
+                reader,
+                writer,
                 read_buffer: MessageBuf::new_with_min_available(MSG_BUF_SIZE),
-            })
+            }
+        })
     }
 
     pub async fn exec(&mut self) {
@@ -191,7 +206,7 @@ impl Peer {
         assert_eq!(self.handhake_len(), buf.len());
 
         log::info!("Handshake init with: {:?}", self.ip);
-        self.stream.write_all(&buf[..]).await?;
+        self.writer.write_all(&buf[..]).await?;
         log::info!("Handshake sent");
 
         self.read_handshake().await?;
@@ -248,7 +263,7 @@ impl Peer {
                 self.idx,
                 self.read_buffer.buffer().len()
             );
-            let read_len = self.stream.read(&mut self.read_buffer.buffer()).await?;
+            let read_len = self.reader.read(&mut self.read_buffer.buffer()).await?;
             self.read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 
@@ -275,7 +290,7 @@ impl Peer {
                 self.idx,
                 self.read_buffer.buffer().len()
             );
-            let read_len = self.stream.read(&mut self.read_buffer.buffer()).await?;
+            let read_len = self.reader.read(&mut self.read_buffer.buffer()).await?;
             self.read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 
@@ -384,10 +399,10 @@ impl Peer {
         to_buf!((1u32 << 14) as u32, buf_out);
 
         log::info!("{} Request", self.idx);
-        self.stream.write_all(&mut buf_out).await?;
+        self.writer.write_all(&mut buf_out).await?;
 
         log::info!("{} Wait for piece", self.idx);
-        let read_len = self.stream.read(&mut buf_in).await?;
+        let read_len = self.reader.read(&mut buf_in).await?;
 
         dbg!(&buf_in[0..16.min(read_len)]);
 
