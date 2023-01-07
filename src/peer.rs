@@ -8,13 +8,10 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
-use crate::defs::*;
+use crate::download::*;
 use crate::macros::*;
 use crate::IP;
-
-const HANDSHAKE_PSTR: &'static [u8; 19] = b"BitTorrent protocol";
-const PIECE_SIZE: usize = 1 << 14;
-const MSG_BUF_SIZE: usize = PIECE_SIZE + 1024; // Some extra buffer in case multiple messages are coming in.
+use crate::{defs::*, download};
 
 #[derive(Debug)]
 pub struct MessageBuf {
@@ -131,11 +128,22 @@ pub struct Peer {
     idx: usize,
     ip: IP,
     info_hash: Arc<Vec<u8>>,
+    download: Arc<Mutex<Download>>,
 }
 
 impl Peer {
-    pub fn new(idx: usize, ip: IP, info_hash: Arc<Vec<u8>>) -> Self {
-        Self { idx, ip, info_hash }
+    pub fn new(
+        idx: usize,
+        ip: IP,
+        info_hash: Arc<Vec<u8>>,
+        download: Arc<Mutex<Download>>,
+    ) -> Self {
+        Self {
+            idx,
+            ip,
+            info_hash,
+            download,
+        }
     }
 
     pub async fn exec(&self) {
@@ -168,15 +176,20 @@ impl Peer {
                 return;
             }
 
+            let mut pull_complete = false;
+
             loop {
                 match *writer_state.lock().await {
                     PeerState::NeedHandshake => panic!("Unexpected state"),
                     PeerState::Dead => break,
                     PeerState::Pulling => {
-                        if Peer::request(&mut writer).await.is_err() {
+                        if !pull_complete && Peer::request(&mut writer).await.is_err() {
                             log::error!("{} Request message error", self.idx);
+                            return;
                         }
-                        return;
+                        pull_complete = true;
+
+                        tokio::task::yield_now().await;
                     }
                     PeerState::Choked => {
                         log::info!("{} Still in choked state - yielding", self.idx);
@@ -200,14 +213,21 @@ impl Peer {
                 log::info!("{} Got post-handshake message: {:?}", self.idx, last_msg);
 
                 match last_msg {
-                    Some(PeerMessage::Bitfield(bitfields)) => {
+                    Some(PeerMessage::Bitfield(_bitfields)) => {
                         // FIXME: use bitfields to know what is available
-                        log::info!("{} Bitfields are in", self.idx);
-                        *(reader_state.lock().await) = PeerState::Pulling;
+                        log::info!(
+                            "{} Bitfields are in (lets pretend we recorded it)",
+                            self.idx
+                        );
+                        // *(reader_state.lock().await) = PeerState::Pulling;
                     }
                     Some(PeerMessage::KeepAlive) => {
                         log::info!("{} KeepAlive", self.idx);
                         tokio::task::yield_now().await;
+                    }
+                    Some(PeerMessage::Unchoke) => {
+                        log::info!("{} Unchoked", self.idx);
+                        *(reader_state.lock().await) = PeerState::Pulling;
                     }
                     None => {
                         log::error!("{} Invalid post handshake message", self.idx);
@@ -372,6 +392,13 @@ impl Peer {
             msg_len,
             current.len()
         );
+
+        if msg_len == 0 {
+            log::error!("{} Invalid message length: {}", self.idx, msg_len);
+            dbg!(current);
+            panic!("Cannot handle invalid message length!");
+        }
+
         current.len() >= msg_len + 4
     }
 

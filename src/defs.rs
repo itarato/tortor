@@ -11,3 +11,7 @@ pub static ANNOUNCE_EVENT_COMPLETED: u32 = 1;
 pub static ANNOUNCE_EVENT_STARTED: u32 = 2;
 pub static ANNOUNCE_EVENT_STOPPED: u32 = 3;
 pub static MAX_PEERS: i32 = 16;
+
+pub const HANDSHAKE_PSTR: &'static [u8; 19] = b"BitTorrent protocol";
+pub const PIECE_SIZE: usize = 1 << 14;
+pub const MSG_BUF_SIZE: usize = PIECE_SIZE + 1024; // Some extra buffer in case multiple messages are coming in.

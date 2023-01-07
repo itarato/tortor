@@ -1,6 +1,7 @@
 mod ben_type;
 mod byte_reader;
 mod defs;
+mod download;
 mod macros;
 mod peer;
 mod stable_hash_map;
@@ -13,9 +14,11 @@ use simple_logger::SimpleLogger;
 use std::{error::Error, fs::File, io::Read, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio::spawn;
+use tokio::sync::Mutex;
 
 use crate::ben_type::*;
 use crate::defs::*;
+use crate::download::*;
 use crate::macros::*;
 use crate::peer::*;
 
@@ -322,14 +325,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut thread_handlers = vec![];
     let info_hash = Arc::new(tracker.info_hash.clone());
+
+    let fragment_len = tracker.info.piece_len / PIECE_SIZE;
+    let download = Arc::new(Mutex::new(Download::new(
+        tracker.info.pieces.len(),
+        fragment_len,
+    )));
+
     for (idx, peer_addr) in announce_response.peer_addr_list.iter().enumerate() {
         let peer_addr = peer_addr.clone();
         let info_hash_ref = info_hash.clone();
+        let download_clone = download.clone();
 
         let thread_handle = spawn(async move {
             log::info!("Thread spawn for peer execution");
 
-            Peer::new(idx, peer_addr, info_hash_ref).exec().await;
+            Peer::new(idx, peer_addr, info_hash_ref, download_clone)
+                .exec()
+                .await;
         });
         thread_handlers.push(thread_handle);
     }
