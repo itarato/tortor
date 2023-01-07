@@ -326,10 +326,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut thread_handlers = vec![];
     let info_hash = Arc::new(tracker.info_hash.clone());
 
-    let fragment_len = tracker.info.piece_len / PIECE_SIZE;
     let download = Arc::new(Mutex::new(Download::new(
-        tracker.info.pieces.len(),
-        fragment_len,
+        tracker.info.len,
+        tracker.info.piece_len,
     )));
 
     for (idx, peer_addr) in announce_response.peer_addr_list.iter().enumerate() {
