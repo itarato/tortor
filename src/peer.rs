@@ -187,7 +187,6 @@ impl Peer {
                     PeerState::Pulling => {
                         if pull_complete {
                             tokio::time::sleep(Duration::from_secs(1)).await;
-                            tokio::task::yield_now().await;
                             continue;
                         }
 
@@ -217,8 +216,7 @@ impl Peer {
                         tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                     PeerState::Choked => {
-                        log::info!("{} Still in choked state - yielding", self.idx);
-                        // tokio::task::yield_now().await;
+                        log::info!("{} Still in choked state - sleeping", self.idx);
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 };
@@ -249,7 +247,6 @@ impl Peer {
                     }
                     Some(PeerMessage::KeepAlive) => {
                         log::info!("{} KeepAlive", self.idx);
-                        // tokio::task::yield_now().await;
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     Some(PeerMessage::Unchoke) => {
@@ -367,7 +364,11 @@ impl Peer {
                 self.idx,
                 read_buffer.buffer().len()
             );
-            let read_len = stream.read(&mut read_buffer.buffer()).await?;
+            let read_len = tokio::time::timeout(
+                Duration::from_secs(3),
+                stream.read(&mut read_buffer.buffer()),
+            )
+            .await??;
             read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 
@@ -398,7 +399,12 @@ impl Peer {
                 self.idx,
                 read_buffer.buffer().len()
             );
-            let read_len = stream.read(&mut read_buffer.buffer()).await?;
+
+            let read_len = tokio::time::timeout(
+                Duration::from_secs(3),
+                stream.read(&mut read_buffer.buffer()),
+            )
+            .await??;
             read_buffer.register_read_len(read_len);
             log::info!("{} Read {} bytes", self.idx, read_len);
 

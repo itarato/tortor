@@ -38,7 +38,7 @@ impl<K: Eq + Hash, V> StableHashMap<K, V> {
             .keys
             .iter()
             .position(|e| e == key)
-            .expect(format!("Has key: {}", key).as_str());
+            .expect(format!("Missing key: {}", key).as_str());
         self.keys.remove(key_position);
         v
     }
