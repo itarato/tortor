@@ -1,6 +1,8 @@
 use std::error::Error;
 use std::io;
+use std::sync::atomic::AtomicI8;
 use std::sync::Arc;
+use std::time::Duration;
 
 use num_traits::FromPrimitive;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -8,10 +10,10 @@ use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
+use crate::defs::*;
 use crate::download::*;
 use crate::macros::*;
 use crate::IP;
-use crate::{defs::*, download};
 
 #[derive(Debug)]
 pub struct MessageBuf {
@@ -183,17 +185,41 @@ impl Peer {
                     PeerState::NeedHandshake => panic!("Unexpected state"),
                     PeerState::Dead => break,
                     PeerState::Pulling => {
-                        if !pull_complete && Peer::request(&mut writer).await.is_err() {
+                        if pull_complete {
+                            tokio::time::sleep(Duration::from_secs(1)).await;
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+
+                        let mut download = self.download.lock().await;
+                        let next_fragment_info = download.next_not_requested_fragment();
+
+                        if next_fragment_info.is_none() {
+                            pull_complete = true;
+                            continue;
+                        }
+
+                        let (piece_idx, fragment_idx) = next_fragment_info.unwrap();
+                        download.pieces[piece_idx].mark_requested(fragment_idx);
+
+                        if Peer::request(
+                            &mut writer,
+                            piece_idx as u32,
+                            (fragment_idx * FRAGMENT_SIZE) as u32,
+                        )
+                        .await
+                        .is_err()
+                        {
                             log::error!("{} Request message error", self.idx);
                             return;
                         }
-                        pull_complete = true;
 
-                        tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_secs(3)).await;
                     }
                     PeerState::Choked => {
                         log::info!("{} Still in choked state - yielding", self.idx);
-                        tokio::task::yield_now().await;
+                        // tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                 };
             }
@@ -223,11 +249,20 @@ impl Peer {
                     }
                     Some(PeerMessage::KeepAlive) => {
                         log::info!("{} KeepAlive", self.idx);
-                        tokio::task::yield_now().await;
+                        // tokio::task::yield_now().await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
                     }
                     Some(PeerMessage::Unchoke) => {
                         log::info!("{} Unchoked", self.idx);
                         *(reader_state.lock().await) = PeerState::Pulling;
+                    }
+                    Some(PeerMessage::Piece(index, begin)) => {
+                        log::info!(
+                            "{} Piece came in for piece #{} offset #{}",
+                            self.idx,
+                            index,
+                            begin
+                        );
                     }
                     None => {
                         log::error!("{} Invalid post handshake message", self.idx);
@@ -437,7 +472,12 @@ impl Peer {
                 let length = u32::from_be_bytes(message_raw[9..13].try_into().unwrap());
                 Some(PeerMessage::Request(index, begin, length))
             }
-            7 => Some(PeerMessage::Piece), // FIXME: keep content.
+            7 => {
+                // FIXME: keep content.
+                let index = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
+                let begin = u32::from_be_bytes(message_raw[5..9].try_into().unwrap());
+                Some(PeerMessage::Piece(index, begin))
+            }
             8 => {
                 let index = u32::from_be_bytes(message_raw[1..5].try_into().unwrap());
                 let begin = u32::from_be_bytes(message_raw[5..9].try_into().unwrap());
@@ -456,16 +496,24 @@ impl Peer {
         message
     }
 
-    pub async fn request(stream: &mut WriteHalf<'_>) -> Result<(), io::Error> {
+    pub async fn request(
+        stream: &mut WriteHalf<'_>,
+        piece_index: u32,
+        piece_offset: u32,
+    ) -> Result<(), io::Error> {
         let mut buf_out: Vec<u8> = vec![];
 
         to_buf!(13u32, buf_out);
         to_buf!(6u8, buf_out);
-        to_buf!(0u32, buf_out);
-        to_buf!(0u32, buf_out);
-        to_buf!((1u32 << 14) as u32, buf_out);
+        to_buf!(piece_index, buf_out);
+        to_buf!(piece_offset, buf_out);
+        to_buf!(FRAGMENT_SIZE as u32, buf_out);
 
-        log::info!("Sent: request");
+        log::info!(
+            "Sent: request for piece #{} and offset #{}",
+            piece_index,
+            piece_offset
+        );
         stream.write_all(&mut buf_out).await?;
 
         Ok(())
@@ -494,7 +542,7 @@ pub enum PeerMessage {
     Have(u32),              // Piece index.
     Bitfield(Vec<u8>),      // Bitfields.
     Request(u32, u32, u32), // Index, begin, length.
-    Piece,
-    Cancel(u32, u32, u32), // Index, begin, length.
-    Port(u16),             // Port.
+    Piece(u32, u32),        // Index, begin.
+    Cancel(u32, u32, u32),  // Index, begin, length.
+    Port(u16),              // Port.
 }
