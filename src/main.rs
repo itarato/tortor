@@ -329,6 +329,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let download = Arc::new(Mutex::new(Download::new(
         tracker.info.len,
         tracker.info.piece_len,
+        FRAGMENT_SIZE,
     )));
 
     for (idx, peer_addr) in announce_response.peer_addr_list.iter().enumerate() {
